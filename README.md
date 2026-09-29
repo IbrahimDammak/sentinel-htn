@@ -49,7 +49,7 @@ fit/calibration people; robustness runs perturb only the test people's data.
 
 - `metrics.json`: main model, ablations, robustness, fairness, thresholds and an example ledger
 - `report.md`: tables for metrics A-F, ablations with deltas vs the full model, robustness, fairness by skin_ita tercile, and one evidence ledger for a warned converter
-- `calibration.png`, `lead_time.png`, `risk_coverage.png`
+- `calibration.png`, `lead_time.png`, `risk_coverage.png`, `lead_vs_budget.png` (sensitivity at >= 90 d lead vs warning budget for full, level_only, cuff_only)
 
 Metrics: A predictive (AUROC, AUPRC), B early detection (lead time, sensitivity at 0/30/90/180 days lead),
 C false-alarm burden (alarms per non-converter person-year, warning precision), D calibration (Brier, ECE),

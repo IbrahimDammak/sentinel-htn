@@ -89,7 +89,8 @@ reference or NaN), onset (float day true drift began — SYNTHETIC ONLY, never a
   - identity and label: pid, week, `y` (1 if t_ref ∈ (7·week, 7·(week+horizon)])
   - level: age, sex_m, bmi, cuff_sbp_last, cuff_dbp_last, cuff_days_since, rhr_level (mean `night_rhr_adj` over
     the last 28 days)
-  - change: dev, dev_slope12 (OLS slope of dev over the last 12 weeks), cusum, n_exceed, n_eval, persist
+  - change: dev, dev_slope12 (OLS slope of dev over the last 12 weeks), cusum, n_exceed, n_eval, persist, trend
+    and trend_z (causal Kalman local-linear-trend slope of dev per week, and slope / posterior SD)
   - quality: valid_days_30
   - NaN handling: impute a training median plus a missing indicator; do it inside `fit`, not here.
 - `FEATURE_SETS`: dict 'full' / 'level_only' / 'cuff_only' / 'change_only' → column lists. The nulls

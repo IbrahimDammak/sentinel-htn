@@ -5,7 +5,7 @@ from scipy.optimize import minimize
 from scipy.special import expit, logit
 
 LEVEL = ['age', 'sex_m', 'bmi', 'rhr_level', 'cuff_sbp_last', 'cuff_dbp_last', 'cuff_days_since']
-CHANGE = ['dev', 'dev_slope12', 'cusum', 'n_exceed', 'n_eval', 'persist']
+CHANGE = ['dev', 'dev_slope12', 'cusum', 'n_exceed', 'n_eval', 'persist', 'trend', 'trend_z']
 QUALITY_COLS = ['valid_days_30']
 FEATURE_SETS = {
     'full': LEVEL + CHANGE + QUALITY_COLS,
@@ -21,6 +21,26 @@ def _roll(a, n):
     r = c.copy()
     r[:, n:] = c[:, n:] - c[:, :-n]
     return r
+
+
+def local_trend(y, obs, q_level=0.03 ** 2, q_slope=0.003 ** 2, r=0.2 ** 2, p_slope0=0.01 ** 2):
+    """Causal Kalman filter, local linear trend (level + slope/week), one person per row of y (person x week).
+
+    Unobserved weeks are prediction steps only. Column t uses y[:, :t+1] only. Returns (slope, slope SD)."""
+    P, W = y.shape
+    lv, b = np.zeros(P), np.zeros(P)
+    p11, p12, p22 = np.ones(P), np.zeros(P), np.full(P, p_slope0)
+    slope, sd = np.empty((P, W)), np.empty((P, W))
+    for t in range(W):
+        lv, p11, p12, p22 = lv + b, p11 + 2 * p12 + p22 + q_level, p12 + p22, p22 + q_slope   # predict
+        o = obs[:, t]
+        k1, k2 = p11 / (p11 + r), p12 / (p11 + r)
+        v = np.where(o, y[:, t] - lv, 0.0)
+        lv, b = lv + k1 * v, b + k2 * v
+        p22 = np.where(o, p22 - k2 * p12, p22)
+        p11, p12 = np.where(o, (1 - k1) * p11, p11), np.where(o, (1 - k1) * p12, p12)
+        slope[:, t], sd[:, t] = b, np.sqrt(p22)
+    return slope, sd
 
 
 def make_landmarks(wk, daily, people, horizon_weeks=26):
@@ -72,6 +92,11 @@ def make_landmarks(wk, daily, people, horizon_weeks=26):
     with np.errstate(invalid='ignore', divide='ignore'):
         slope = np.where((n >= 3) & (den > 0), (n * sxy - sx * sy) / den, np.nan)
     lm['dev_slope12'] = slope[li, lw]
+    # Kalman local linear trend of dev over evaluable weeks: posterior slope and slope/SD ("trend z")
+    ev = np.zeros((P, W), bool)
+    ev[wi, wk.week] = wk.evaluable.astype(bool)
+    tr, tsd = local_trend(y0, ev)
+    lm['trend'], lm['trend_z'] = tr[li, lw], tr[li, lw] / tsd[li, lw]
 
     mo = daily.assign(week=daily.day // 7).groupby(['pid', 'week']).month.first().rename('month').reset_index()
     lm = lm.merge(mo, on=['pid', 'week'], how='left')

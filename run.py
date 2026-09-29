@@ -24,6 +24,7 @@ ABLATIONS = {'level_only': {'features': 'level_only'}, 'cuff_only': {'features':
 ROBUSTNESS = {'mcar_0.3': ('mcar', 0.3, {}), 'mcar_0.6': ('mcar', 0.6, {}), 'noise_1.0': ('noise', 1.0, {}),
               'drop_night_rmssd': ('drop_channel', 1.0, {'channel': 'night_rmssd'}), 'mnar_0.4': ('mnar', 0.4, {}),
               'sensor_fail_0.3': ('sensor_fail', 0.3, {})}
+BUDGETS = (0.25, 0.5, 1.0, 2.0)   # warning episodes per non-converter person-year (operating curve)
 KEY = ['auroc', 'auprc', 'sens_lead_90', 'median_lead', 'alarms_per_nonconv_py', 'warning_precision',
        'brier', 'ece', 'aurc', 'abstention_rate']
 
@@ -79,8 +80,9 @@ def pipeline(daily, people, split, cfg, fitted=None, perturb=None):
         lm = _landmarks(wk, d, people)
         model = predict.fit(inn(lm, 'fit'), inn(lm, 'cal'), predict.FEATURE_SETS[cfg['features']],
                             n_boot=cfg['n_boot'], seed=cfg['seed'])
-        thr_p = warn.tune_warning(predict.predict(model, inn(lm, 'cal')), inn(people, 'cal'))
-        fitted = ({'ctx': ctx, 'prior': prior, 'model': model}, {'thr': thr, 'thr_p': thr_p})
+        pred_cal = predict.predict(model, inn(lm, 'cal'))
+        thr_p = warn.tune_warning(pred_cal, inn(people, 'cal'))
+        fitted = ({'ctx': ctx, 'prior': prior, 'model': model, 'pred_cal': pred_cal}, {'thr': thr, 'thr_p': thr_p})
     models, th = fitted
     dt = inn(daily, 'test')
     if perturb:
@@ -90,6 +92,25 @@ def pipeline(daily, people, split, cfg, fitted=None, perturb=None):
     wk = _weeks(d, models['prior'], cfg, th['thr'])
     dec = warn.decide(predict.predict(models['model'], _landmarks(wk, d, people)), th['thr_p'])
     return dec, wk, models, th
+
+
+def operating_curve(fits, people, split, budgets=BUDGETS):
+    """Early-warning operating curve: for each warning budget, re-tune thr_p on the calibration people and
+    re-decide the test weeks -> {model: {budget: sens_lead_90, alarms, precision}}. fits = {name: (dec, models)}.
+    'chance' = no-skill floor: warnings at random times at rate = budget, from baseline-ready to t_ref - 90 d."""
+    cal, tp = people[people.pid.isin(split['cal'])], people[people.pid.isin(split['test'])]
+    out = {}
+    for name, (dec, models) in fits.items():
+        out[name] = {}
+        for b in budgets:
+            m = metrics(warn.decide(dec, warn.tune_warning(models['pred_cal'], cal, budget=b)), tp)
+            out[name][b] = {k: m[k] for k in ('sens_lead_90', 'alarms_per_nonconv_py', 'warning_precision')}
+    conv = tp[tp.converter.astype(bool)]
+    start = conv.pid.map(7 * fits['full'][0].groupby('pid').week.min())
+    years = ((conv.t_ref - 90 - start).clip(lower=0).fillna(0) / 365.25).to_numpy()
+    out['chance'] = {b: {'sens_lead_90': float(np.mean(1 - np.exp(-b * years))), 'alarms_per_nonconv_py': b,
+                         'warning_precision': float('nan')} for b in budgets}
+    return out
 
 
 def _clean(o):
@@ -137,7 +158,7 @@ def example_ledger(dec, wk, tp):
             **warn.ledger(dec, wk, pid, week)}
 
 
-def figures(out, dec, decs, tp):
+def figures(out, dec, decs, tp, curve):
     d = dec.dropna(subset=['p', 'y'])
     mp, my, n = calibration_bins(d.y, d.p)
     fig, ax = plt.subplots(figsize=(4.5, 4.5))
@@ -160,6 +181,16 @@ def figures(out, dec, decs, tp):
     ax.legend(fontsize=7)
     fig.tight_layout()
     fig.savefig(os.path.join(out, 'risk_coverage.png'), dpi=120)
+    fig, ax = plt.subplots(figsize=(5, 3.5))
+    for name, rows in curve.items():
+        r = list(rows.values())
+        ax.plot([v['alarms_per_nonconv_py'] for v in r], [v['sens_lead_90'] for v in r],
+                'k--' if name == 'chance' else 'o-', label=name, lw=2 if name == 'full' else 1)
+    ax.set(xlabel='warning alarms per non-converter person-year (test)', ylabel='sensitivity at >= 90 d lead',
+           title='Early-warning operating curve')
+    ax.legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out, 'lead_vs_budget.png'), dpi=120)
     plt.close('all')
 
 
@@ -179,9 +210,13 @@ def write_report(path, res, args_str):
           table({'clean': main, **res['robustness']}, KEY, ref='clean'), '',
           '## Fairness (E8): by skin_ita tercile', '',
           table({k: v for k, v in res['fairness'].items()}, ['n_people', 'n_converters', *KEY]), '',
-          '## Example evidence ledger (first warning of a warned converter)', '']
+          '## Early-warning operating curve: sensitivity at >= 90 d lead (alarms/non-converter-yr) per warning budget', '',
+          '| budget | ' + ' | '.join(res['operating_curve']) + ' |', '|---' * (len(res['operating_curve']) + 1) + '|']
+    L += [f'| {b} | ' + ' | '.join(f"{_f(c[b]['sens_lead_90'])} ({_f(c[b]['alarms_per_nonconv_py'])})"
+                                    for c in res['operating_curve'].values()) + ' |' for b in BUDGETS]
+    L += ['', '## Example evidence ledger (first warning of a warned converter)', '']
     L += ['```json', json.dumps(_clean(res['ledger']), indent=2), '```'] if res['ledger'] else ['No converter was warned before t_ref in the test set.']
-    L += ['', 'Figures: `calibration.png`, `lead_time.png`, `risk_coverage.png`.', '']
+    L += ['', 'Figures: `calibration.png`, `lead_time.png`, `risk_coverage.png`, `lead_vs_budget.png`.', '']
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(L))
 
@@ -208,10 +243,11 @@ def main():
 
     dec, wk, models, th = pipeline(daily, people, split, cfg)
     res = {'main': metrics(dec, tp), 'thresholds': th, 'ablations': {}, 'robustness': {}}
-    decs = {'full': dec}
-    for name, over in ABLATIONS.items():
-        decs[name] = pipeline(daily, people, split, {**cfg, **over})[0]
-        res['ablations'][name] = metrics(decs[name], tp)
+    abl = {name: pipeline(daily, people, split, {**cfg, **over}) for name, over in ABLATIONS.items()}
+    decs = {'full': dec, **{k: v[0] for k, v in abl.items()}}
+    res['ablations'] = {k: metrics(v[0], tp) for k, v in abl.items()}
+    fits = {'full': (dec, models), **{k: (abl[k][0], abl[k][2]) for k in ('level_only', 'cuff_only')}}
+    res['operating_curve'] = operating_curve(fits, people, split)
     for name, pt in ROBUSTNESS.items():
         res['robustness'][name] = metrics(pipeline(daily, people, split, cfg, (models, th), pt)[0], tp)
     res['fairness'] = by_group(dec, tp, 'skin_ita', 3).to_dict('index')
@@ -220,7 +256,7 @@ def main():
     with open(os.path.join(a.out, 'metrics.json'), 'w') as f:
         json.dump(_clean(res), f, indent=2)
     write_report(os.path.join(a.out, 'report.md'), res, f'n={n}, days={days}, seed={a.seed}, n_boot={n_boot}')
-    figures(a.out, dec, decs, tp)
+    figures(a.out, dec, decs, tp, res['operating_curve'])
 
     m = res['main']
     print(f'SENTINEL-HTN ({n} people, {days} days; test {m["n_people"]} people, {m["n_converters"]} converters)')
@@ -229,7 +265,9 @@ def main():
           f'median lead {_f(m["median_lead"])} d')
     print(f'  alarms/non-converter-yr {_f(m["alarms_per_nonconv_py"])}  warning precision {_f(m["warning_precision"])}  '
           f'AURC {_f(m["aurc"])}  abstention {_f(m["abstention_rate"])}')
-    print(f'  wrote {a.out}/metrics.json, report.md, calibration.png, lead_time.png, risk_coverage.png')
+    print('  Se@90 by warning budget ' + '  '.join(f'{k}: ' + '/'.join(_f(v['sens_lead_90']) for v in c.values())
+                                               for k, c in res['operating_curve'].items()) + f'  (budgets {BUDGETS})')
+    print(f'  wrote {a.out}/metrics.json, report.md, calibration.png, lead_time.png, risk_coverage.png, lead_vs_budget.png')
 
 
 if __name__ == '__main__':

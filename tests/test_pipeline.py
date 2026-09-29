@@ -5,10 +5,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import numpy as np
+
 import run
 from sentinel import STATES, data
 from sentinel.evaluate import metrics
-from sentinel.predict import FEATURE_SETS
+from sentinel.predict import FEATURE_SETS, local_trend
 
 KEYS = ['auroc', 'auprc', 'sens_lead_0', 'sens_lead_30', 'sens_lead_90', 'sens_lead_180', 'median_lead',
         'alarms_per_nonconv_py', 'warning_precision', 'brier', 'ece', 'aurc', 'abstention_rate']
@@ -16,6 +18,11 @@ KEYS = ['auroc', 'auprc', 'sens_lead_0', 'sens_lead_30', 'sens_lead_90', 'sens_l
 if __name__ == '__main__':
     assert 'STABLE' not in STATES and len(STATES) == 3
     assert all('onset' not in cols for cols in FEATURE_SETS.values())
+    y = np.random.default_rng(0).normal(0, .2, (5, 40))
+    ok = y > -.3
+    s1 = local_trend(y, ok)[0]
+    y[:, 25:] += 3
+    assert np.allclose(s1[:, :25], local_trend(y, ok)[0][:, :25])   # Kalman trend at week t ignores weeks > t
     daily, people = data.make_cohort(400, 450, seed=0)
     split = run.make_split(people, 0)
     tp = people[people.pid.isin(split['test'])]
