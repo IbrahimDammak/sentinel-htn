@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+results_quick/
+# Audit packets reproduce publisher abstracts verbatim; regenerate with:
+#   python debate/tools/packets.py debate/audit/packets debate/round1/*.md
+debate/audit/packets/
