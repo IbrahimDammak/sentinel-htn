@@ -1,0 +1,40 @@
+{
+  "synthetic_nonconverters": {
+    "people": 200,
+    "person_years": 273.52224503764546,
+    "valid_day_share": 0.6741851851851852,
+    "cover_night_rhr": 0.6423941108608471,
+    "cover_night_rmssd": 0.6423941108608471,
+    "cover_still_hr": 0.6423941108608471,
+    "cover_steps": 1.0,
+    "cover_sleep_dur": 1.0,
+    "cover_sleep_reg": 1.0,
+    "evaluable_week_share": 0.7078846153846153,
+    "dev_sd": 0.36800924422750586,
+    "abstention_rate": 0.11350896860986547,
+    "watch_episodes_py": 1.49165198590647,
+    "warning_episodes_py": 0.5081853579436258,
+    "people_warned": 0.38
+  },
+  "lifesnaps": {
+    "people": 49,
+    "person_years": 8.317590691307323,
+    "valid_day_share": 0.6649185240681775,
+    "cover_night_rhr": 0.5757746478873239,
+    "cover_night_rmssd": 0.5757746478873239,
+    "cover_still_hr": 0.8219718309859155,
+    "cover_steps": 0.995774647887324,
+    "cover_sleep_dur": 1.0,
+    "cover_sleep_reg": 0.8892957746478873,
+    "evaluable_week_share": 0.24594363791631085,
+    "dev_sd": 0.5223330382403714,
+    "abstention_rate": 0.23271889400921658,
+    "watch_episodes_py": 0.8415898617511521,
+    "warning_episodes_py": 0.0,
+    "people_warned": 0.0
+  },
+  "thresholds": {
+    "thr": 0.15,
+    "thr_p": 0.08
+  }
+}

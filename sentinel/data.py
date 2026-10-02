@@ -1,18 +1,28 @@
 """Synthetic AIoT cohort, CSV loader and robustness perturbations (schema: CONTRACT.md)."""
 import numpy as np
 import pandas as pd
+from scipy.signal import lfilter
 
 from . import CHANNELS, ACUTE_CONTEXT, DAILY_COLUMNS, PEOPLE_COLUMNS, HTN_SBP, HTN_DBP
 
-# channel: (between-person mean, between-person SD, day-to-day SD, coupling per mmHg of latent dSBP)
+# channel: (person mean, between-person SD, day-to-day SD, day-to-day AR(1) rho, coupling per mmHg of latent dSBP)
+# Calibrated on LifeSnaps (71 people, Fitbit Sense; results/lifesnaps/real_world.md): means, spreads, total
+# within-person SD and lag-1 autocorrelation match the real data once the simulated confounders are added.
+# Couplings are assumptions (no real BP-drift data).
 _CH = {
-    'night_rhr': (60, 7, 2.5, 0.15),
-    'night_rmssd': (40, 12, 6, -0.35),
-    'still_hr': (70, 8, 4, 0.12),
-    'steps': (8000, 2500, 2000, -40),
-    'sleep_dur': (7, 0.7, 0.8, -0.01),
-    'sleep_reg': (75, 10, 8, -0.15),
+    'night_rhr': (63.5, 6.8, 4.1, 0.25, 0.15),
+    'night_rmssd': (39.5, 17.8, 6.3, 0.30, -0.35),
+    'still_hr': (66.2, 6.5, 2.0, 0.90, 0.12),       # Fitbit resting HR is a smoothed daily estimate
+    'steps': (8800, 3330, 4100, 0.13, -40),
+    'sleep_dur': (6.55, 1.5, 1.45, 0.0, -0.01),
+    'sleep_reg': (63, 14.7, 14.5, 0.84, -0.15),     # 7-night rolling proxy -> strongly autocorrelated
 }
+
+
+def _ar1(rng, n, sd, rho, burn=60):
+    """Stationary AR(1) noise with marginal SD sd."""
+    e = rng.normal(0, sd * np.sqrt(1 - rho ** 2), n + burn)
+    return lfilter([1.0], [1.0, -rho], e)[burn:]
 
 
 def _spans(rng, days, per_year, lo, hi):
@@ -23,7 +33,7 @@ def _spans(rng, days, per_year, lo, hi):
     return m
 
 
-def _person(rng, days, conv):
+def _person(rng, days, conv, effect=1.0):
     """One person's daily arrays (dict) and people-row fields (dict)."""
     d = np.arange(days)
     sex = 'F' if rng.random() < .5 else 'M'
@@ -52,7 +62,7 @@ def _person(rng, days, conv):
         men = ((d + rng.integers(0, 28)) % 28 >= 14).astype(float)   # luteal phase = 1
     fw = (d >= rng.integers(0, days)).astype(int) if rng.random() < .3 else np.zeros(days, int)
     # channels
-    x = {c: rng.normal(mu, sd) + k * dsbp + rng.normal(0, sdd, days) for c, (mu, sd, sdd, k) in _CH.items()}
+    x = {c: rng.normal(mu, sd) + effect * k * dsbp + _ar1(rng, days, sdd, rho) for c, (mu, sd, sdd, rho, k) in _CH.items()}
     x['night_rhr'] += 0.05 * cold + 5 * ill + 3 * alc + 2 * (ex > 45) + 2 * (men == 1) + 1.5 * fw
     x['night_rmssd'] += -8 * ill - 6 * alc
     x['steps'] = np.maximum(x['steps'], 0)
@@ -85,11 +95,12 @@ def _person(rng, days, conv):
     return daily, person
 
 
-def make_cohort(n_people=600, days=540, seed=0, converter_rate=0.35):
-    """Simulate (daily, people) with latent BP drift, confounders, missingness and cuff labels."""
+def make_cohort(n_people=600, days=540, seed=0, converter_rate=0.35, effect=1.0):
+    """Simulate (daily, people) with latent BP drift, confounders, missingness and cuff labels.
+    effect scales the channel-to-BP couplings (1 = calibrated default; >1 = strong-signal sanity cohort for tests)."""
     rng = np.random.default_rng(seed)
     pids = [f'P{i:04d}' for i in range(n_people)]
-    ds, ps = zip(*[_person(rng, days, rng.random() < converter_rate) for _ in pids])
+    ds, ps = zip(*[_person(rng, days, rng.random() < converter_rate, effect) for _ in pids])
     daily = pd.DataFrame({k: np.concatenate([d[k] for d in ds]) for k in ds[0]})
     daily.insert(0, 'pid', np.repeat(pids, days))
     people = pd.DataFrame(list(ps))

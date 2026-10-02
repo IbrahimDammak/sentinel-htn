@@ -5,7 +5,7 @@ from scipy.optimize import minimize
 from scipy.special import expit, logit
 
 LEVEL = ['age', 'sex_m', 'bmi', 'rhr_level', 'cuff_sbp_last', 'cuff_dbp_last', 'cuff_days_since']
-CHANGE = ['dev', 'dev_slope12', 'cusum', 'n_exceed', 'n_eval', 'persist']
+CHANGE = ['dev', 'dev_slope12', 'cusum', 'n_exceed', 'n_eval', 'persist', 'trend', 'trend_z']
 QUALITY_COLS = ['valid_days_30']
 FEATURE_SETS = {
     'full': LEVEL + CHANGE + QUALITY_COLS,
@@ -23,7 +23,29 @@ def _roll(a, n):
     return r
 
 
-def make_landmarks(wk, daily, people, horizon_weeks=26):
+# r = weekly dev noise variance; default measured on the LifeSnaps-calibrated simulator (SD 0.371). run.pipeline
+# passes the value measured on its own training split (make_landmarks(trend_r=...)), so it never goes stale.
+def local_trend(y, obs, q_level=0.03 ** 2, q_slope=0.003 ** 2, r=0.37 ** 2, p_slope0=0.01 ** 2):
+    """Causal Kalman filter, local linear trend (level + slope/week), one person per row of y (person x week).
+
+    Unobserved weeks are prediction steps only. Column t uses y[:, :t+1] only. Returns (slope, slope SD)."""
+    P, W = y.shape
+    lv, b = np.zeros(P), np.zeros(P)
+    p11, p12, p22 = np.ones(P), np.zeros(P), np.full(P, p_slope0)
+    slope, sd = np.empty((P, W)), np.empty((P, W))
+    for t in range(W):
+        lv, p11, p12, p22 = lv + b, p11 + 2 * p12 + p22 + q_level, p12 + p22, p22 + q_slope   # predict
+        o = obs[:, t]
+        k1, k2 = p11 / (p11 + r), p12 / (p11 + r)
+        v = np.where(o, y[:, t] - lv, 0.0)
+        lv, b = lv + k1 * v, b + k2 * v
+        p22 = np.where(o, p22 - k2 * p12, p22)
+        p11, p12 = np.where(o, (1 - k1) * p11, p11), np.where(o, (1 - k1) * p12, p12)
+        slope[:, t], sd[:, t] = b, np.sqrt(p22)
+    return slope, sd
+
+
+def make_landmarks(wk, daily, people, horizon_weeks=26, trend_r=None):
     """One row per pid-week from baseline-ready until the t_ref week (exclusive); uses only data up to day 7*week+6."""
     wk = wk.sort_values(['pid', 'week']).reset_index(drop=True)
     pe = people.set_index('pid')
@@ -72,6 +94,11 @@ def make_landmarks(wk, daily, people, horizon_weeks=26):
     with np.errstate(invalid='ignore', divide='ignore'):
         slope = np.where((n >= 3) & (den > 0), (n * sxy - sx * sy) / den, np.nan)
     lm['dev_slope12'] = slope[li, lw]
+    # Kalman local linear trend of dev over evaluable weeks: posterior slope and slope/SD ("trend z")
+    ev = np.zeros((P, W), bool)
+    ev[wi, wk.week] = wk.evaluable.astype(bool)
+    tr, tsd = local_trend(y0, ev) if trend_r is None else local_trend(y0, ev, r=trend_r)
+    lm['trend'], lm['trend_z'] = tr[li, lw], tr[li, lw] / tsd[li, lw]
 
     mo = daily.assign(week=daily.day // 7).groupby(['pid', 'week']).month.first().rename('month').reset_index()
     lm = lm.merge(mo, on=['pid', 'week'], how='left')
@@ -88,16 +115,25 @@ def _design(model, lm):
     return (X - model['mu']) / model['sd']
 
 
-def _logit_fit(X, y, l2, w0):
-    """Penalised logistic regression (intercept unpenalised), L-BFGS-B with analytic gradient."""
+def _logit_fit(X, y, l2, w0, sw=None, bounds=None):
+    """Penalised logistic regression (intercept unpenalised, optional row weights sw), L-BFGS-B, analytic gradient."""
     X1 = np.hstack([np.ones((len(X), 1)), X])
+    sw = np.ones(len(X)) if sw is None else sw
 
     def f(w):
         z = X1 @ w
         r = np.r_[0.0, w[1:]]
-        return (np.logaddexp(0, z) - y * z).sum() + 0.5 * l2 * r @ r, X1.T @ (expit(z) - y) + l2 * r
+        return (sw * (np.logaddexp(0, z) - y * z)).sum() + 0.5 * l2 * r @ r, X1.T @ (sw * (expit(z) - y)) + l2 * r
 
-    return minimize(f, w0, jac=True, method='L-BFGS-B').x
+    return minimize(f, w0, jac=True, method='L-BFGS-B', bounds=bounds).x
+
+
+L2 = 10.0     # penalty on person-weighted loss (each person weighs 1); fixed, not tuned on the small calibration set
+FOLDS = 5     # person-grouped folds for out-of-fold calibration scores
+
+
+def _person_weights(lm):
+    return 1.0 / lm.groupby('pid').pid.transform('size').to_numpy(float)
 
 
 def _score(w, X):
@@ -109,8 +145,11 @@ def _calibrate(model, s):
     return expit(a0 + a1 * logit(np.clip(s, 1e-9, 1 - 1e-9)))
 
 
-def fit(lm_fit, lm_cal, cols, l2=1.0, n_boot=20, seed=0):
-    """Fit on lm_fit, bootstrap people for a band, Platt-calibrate on lm_cal."""
+def fit(lm_fit, lm_cal, cols, l2=None, n_boot=20, seed=0):
+    """Fit on lm_fit, bootstrap people for a band, Platt-calibrate on out-of-fold fit scores + lm_cal.
+
+    Rows are weighted 1/(rows of that person): landmark weeks of one person are not independent, so each person
+    counts once and the L2 penalty is relative to the number of people."""
     X0 = lm_fit[cols].astype(float).to_numpy()
     med = np.nan_to_num(np.nanmedian(X0, axis=0))
     miss_ix = np.flatnonzero(np.isnan(X0).any(axis=0))
@@ -119,7 +158,9 @@ def fit(lm_fit, lm_cal, cols, l2=1.0, n_boot=20, seed=0):
     model['mu'], sd = Z.mean(axis=0), Z.std(axis=0)
     model['sd'] = np.where(sd > 0, sd, 1.0)
     X, y = (Z - model['mu']) / model['sd'], lm_fit.y.to_numpy(float)
-    w = _logit_fit(X, y, l2, np.zeros(X.shape[1] + 1))
+    sw = _person_weights(lm_fit)
+    model['l2'] = l2 = L2 if l2 is None else l2
+    w = _logit_fit(X, y, l2, np.zeros(X.shape[1] + 1), sw)
     # ponytail: bootstrap refits reuse the full-fit standardisation/imputation; re-estimate per draw if it matters
     codes = pd.factorize(lm_fit.pid)[0]
     order = np.argsort(codes, kind='stable')
@@ -129,12 +170,19 @@ def fit(lm_fit, lm_cal, cols, l2=1.0, n_boot=20, seed=0):
     for _ in range(n_boot):
         pick = rng.integers(0, codes.max() + 1, codes.max() + 1)
         ix = np.concatenate([order[bnd[k]:bnd[k + 1]] for k in pick])
-        boots.append(_logit_fit(X[ix], y[ix], l2, w))
+        boots.append(_logit_fit(X[ix], y[ix], l2, w, sw[ix]))
     model.update(w=w, boots=np.array(boots).reshape(n_boot, len(w)))
-    # ponytail: Platt, not isotonic — isotonic ties scores at 0 with few calibration events (kills ranking);
-    # switch to isotonic once the calibration set has ~50+ events
-    s = _score(w, _design(model, lm_cal))
-    model['cal'] = _logit_fit(logit(np.clip(s, 1e-9, 1 - 1e-9))[:, None], lm_cal.y.to_numpy(float), 1e-6, np.zeros(2))
+    # Platt (isotonic ties scores at 0 with few events) on out-of-fold fit scores + calibration scores: a small
+    # calibration set alone can rank by chance against the model and flip it. Slope >= 0: never invert the ranking.
+    fold = codes % FOLDS
+    oof = np.empty(len(y))
+    for k in range(FOLDS):
+        tr = fold != k
+        oof[~tr] = _score(_logit_fit(X[tr], y[tr], l2, w, sw[tr]), X[~tr])
+    s = np.r_[oof, _score(w, _design(model, lm_cal))]
+    # unweighted rows: the output is a per-landmark-week risk, so calibrate at row level (person weights shift the base rate)
+    model['cal'] = _logit_fit(logit(np.clip(s, 1e-9, 1 - 1e-9))[:, None], np.r_[y, lm_cal.y.to_numpy(float)], 1e-6,
+                              np.r_[0.0, 1.0], bounds=[(None, None), (0, None)])
     return model
 
 

@@ -13,17 +13,19 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from sentinel import CHANNELS
+from sentinel import CHANNELS, EVIDENCE
 from sentinel import data, detect, learn, predict, warn
 from sentinel.evaluate import by_group, calibration_bins, lead_days, metrics, risk_coverage
 
-BASE = dict(personal=True, context=True, features='full', n_boot=20, seed=0)
+BASE = dict(personal=True, context=True, features='full', weights='evidence', n_boot=20, seed=0)
 ABLATIONS = {'level_only': {'features': 'level_only'}, 'cuff_only': {'features': 'cuff_only'},
              'change_only': {'features': 'change_only'}, 'no_personalisation': {'personal': False},
-             'no_context': {'context': False}}
+             'no_context': {'context': False}, 'equal_weights': {'weights': 'equal'},
+             'reliability_only': {'weights': 'reliability'}}
 ROBUSTNESS = {'mcar_0.3': ('mcar', 0.3, {}), 'mcar_0.6': ('mcar', 0.6, {}), 'noise_1.0': ('noise', 1.0, {}),
               'drop_night_rmssd': ('drop_channel', 1.0, {'channel': 'night_rmssd'}), 'mnar_0.4': ('mnar', 0.4, {}),
               'sensor_fail_0.3': ('sensor_fail', 0.3, {})}
+BUDGETS = (0.25, 0.5, 1.0, 2.0)   # warning episodes per non-converter person-year (operating curve)
 KEY = ['auroc', 'auprc', 'sens_lead_90', 'median_lead', 'alarms_per_nonconv_py', 'warning_precision',
        'brier', 'ece', 'aurc', 'abstention_rate']
 
@@ -51,14 +53,27 @@ def _adjust(d, ctx):
     return d
 
 
-def _weeks(d, prior, cfg, thr=None):
-    """Personal baseline -> weekly deviation -> CUSUM (-> persistence if thr given)."""
-    wk = detect.cusum(detect.weekly(learn.personal_baseline(d, prior, personal=cfg['personal'])))
+def _weeks(d, prior, cfg, thr=None, weights=None):
+    """Personal baseline -> weekly (weighted) deviation -> CUSUM (-> persistence if thr given)."""
+    wk = detect.cusum(detect.weekly(learn.personal_baseline(d, prior, personal=cfg['personal']), weights))
     return wk if thr is None else detect.persistence(wk, thr)
 
 
-def _landmarks(wk, d, people):
-    return predict.make_landmarks(wk, d, people[people.pid.isin(wk.pid.unique())])
+def _weights(d, prior, cfg):
+    """Label-free channel weights on d (training or unlabelled real data); None = equal weights."""
+    if cfg['weights'] == 'equal':
+        return None
+    ev = EVIDENCE if cfg['weights'] == 'evidence' else dict.fromkeys(CHANNELS, 1.0)
+    return detect.channel_weights(detect.weekly(learn.personal_baseline(d, prior, personal=cfg['personal'])), ev)
+
+
+def _trend_r(wk):
+    """Kalman observation variance = variance of the weekly deviation on evaluable weeks (label-free)."""
+    return float(wk.loc[wk.evaluable, 'dev'].var())
+
+
+def _landmarks(wk, d, people, trend_r=None):
+    return predict.make_landmarks(wk, d, people[people.pid.isin(wk.pid.unique())], trend_r=trend_r)
 
 
 def pipeline(daily, people, split, cfg, fitted=None, perturb=None):
@@ -72,24 +87,77 @@ def pipeline(daily, people, split, cfg, fitted=None, perturb=None):
         ctx = learn.fit_context(inn(d, 'fit')) if cfg['context'] else None
         d = _adjust(d, ctx)
         prior = learn.fit_prior(inn(d, 'fit'))
-        wk = _weeks(d, prior, cfg)
+        weights = _weights(inn(d, 'fit'), prior, cfg)
+        wk = _weeks(d, prior, cfg, weights=weights)
+        trend_r = _trend_r(inn(wk, 'fit'))
         # two tiers: persistence = loose "watch" tier (2 episodes/py); the risk gate then confirms to 0.5/py
         thr = detect.tune_threshold(inn(wk, 'fit'), inn(people, 'fit'), budget=2.0)
         wk = detect.persistence(wk, thr)
-        lm = _landmarks(wk, d, people)
+        lm = _landmarks(wk, d, people, trend_r)
         model = predict.fit(inn(lm, 'fit'), inn(lm, 'cal'), predict.FEATURE_SETS[cfg['features']],
                             n_boot=cfg['n_boot'], seed=cfg['seed'])
-        thr_p = warn.tune_warning(predict.predict(model, inn(lm, 'cal')), inn(people, 'cal'))
-        fitted = ({'ctx': ctx, 'prior': prior, 'model': model}, {'thr': thr, 'thr_p': thr_p})
+        pred_cal = predict.predict(model, inn(lm, 'cal'))
+        thr_p = warn.tune_warning(pred_cal, inn(people, 'cal'))
+        fitted = ({'ctx': ctx, 'prior': prior, 'weights': weights, 'trend_r': trend_r, 'model': model,
+                   'pred_cal': pred_cal}, {'thr': thr, 'thr_p': thr_p})
     models, th = fitted
     dt = inn(daily, 'test')
     if perturb:
         kind, level, kw = perturb
         dt = data.perturb(dt, kind, level, seed=cfg['seed'], people=inn(people, 'test'), **kw)
     d = _adjust(learn.quality_gate(dt), models['ctx'])
-    wk = _weeks(d, models['prior'], cfg, th['thr'])
-    dec = warn.decide(predict.predict(models['model'], _landmarks(wk, d, people)), th['thr_p'])
+    wk = _weeks(d, models['prior'], cfg, th['thr'], models['weights'])
+    dec = warn.decide(predict.predict(models['model'], _landmarks(wk, d, people, models['trend_r'])), th['thr_p'])
     return dec, wk, models, th
+
+
+def usage(dec, wk, d, people):
+    """Label-free deployment metrics; every person is treated as a non-converter."""
+    srt = dec.sort_values(['pid', 'week'])
+    py = len(srt) / detect.WEEKS_PER_YEAR
+    warned = warn._episodes((srt.state == 'WARNING').to_numpy(), srt.pid.to_numpy())
+    days = (people.set_index('pid').end_day.reindex(srt.pid.unique()) + 1).sum()
+    ok = d[d.valid]
+    return {'people': int(srt.pid.nunique()), 'person_years': py,
+            'valid_day_share': float(d.valid.sum() / days),
+            **{f'cover_{c}': float(ok[c].notna().mean()) for c in CHANNELS},
+            'evaluable_week_share': float(wk.evaluable.mean()),
+            'dev_sd': float(wk.loc[wk.evaluable, 'dev'].std()),
+            'abstention_rate': float((srt.state == 'POOR_QUALITY').mean()),
+            'watch_episodes_py': float(wk.groupby('pid').episodes.max().sum() / py),
+            'warning_episodes_py': warned / py,
+            'people_warned': float(srt[srt.state == 'WARNING'].pid.nunique() / srt.pid.nunique())}
+
+
+def real_world(daily, people, cfg, fitted):
+    """Transfer test on an unlabelled real cohort: risk model and thresholds come from synthetic training;
+    only the label-free parts (context coefficients, population prior, channel weights, trend noise) are refitted."""
+    models, th = fitted
+    d = learn.quality_gate(daily)
+    d = _adjust(d, learn.fit_context(d) if cfg['context'] else None)
+    prior = learn.fit_prior(d)
+    wk = _weeks(d, prior, cfg, th['thr'], _weights(d, prior, cfg))
+    dec = warn.decide(predict.predict(models['model'], _landmarks(wk, d, people, _trend_r(wk))), th['thr_p'])
+    return usage(dec, wk, d, people)
+
+
+def operating_curve(fits, people, split, budgets=BUDGETS):
+    """Early-warning operating curve: for each warning budget, re-tune thr_p on the calibration people and
+    re-decide the test weeks -> {model: {budget: sens_lead_90, alarms, precision}}. fits = {name: (dec, models)}.
+    'chance' = no-skill floor: warnings at random times at rate = budget, from baseline-ready to t_ref - 90 d."""
+    cal, tp = people[people.pid.isin(split['cal'])], people[people.pid.isin(split['test'])]
+    out = {}
+    for name, (dec, models) in fits.items():
+        out[name] = {}
+        for b in budgets:
+            m = metrics(warn.decide(dec, warn.tune_warning(models['pred_cal'], cal, budget=b)), tp)
+            out[name][b] = {k: m[k] for k in ('sens_lead_90', 'alarms_per_nonconv_py', 'warning_precision')}
+    conv = tp[tp.converter.astype(bool)]
+    start = conv.pid.map(7 * fits['full'][0].groupby('pid').week.min())
+    floor = lambda b, lead: float(np.mean(1 - np.exp(-b * ((conv.t_ref - lead - start).clip(lower=0).fillna(0) / 365.25))))
+    out['chance'] = {b: {'sens_lead_0': floor(b, 0), 'sens_lead_30': floor(b, 30), 'sens_lead_90': floor(b, 90),
+                         'alarms_per_nonconv_py': b, 'warning_precision': float('nan')} for b in budgets}
+    return out
 
 
 def _clean(o):
@@ -137,7 +205,7 @@ def example_ledger(dec, wk, tp):
             **warn.ledger(dec, wk, pid, week)}
 
 
-def figures(out, dec, decs, tp):
+def figures(out, dec, decs, tp, curve):
     d = dec.dropna(subset=['p', 'y'])
     mp, my, n = calibration_bins(d.y, d.p)
     fig, ax = plt.subplots(figsize=(4.5, 4.5))
@@ -160,6 +228,16 @@ def figures(out, dec, decs, tp):
     ax.legend(fontsize=7)
     fig.tight_layout()
     fig.savefig(os.path.join(out, 'risk_coverage.png'), dpi=120)
+    fig, ax = plt.subplots(figsize=(5, 3.5))
+    for name, rows in curve.items():
+        r = list(rows.values())
+        ax.plot([v['alarms_per_nonconv_py'] for v in r], [v['sens_lead_90'] for v in r],
+                'k--' if name == 'chance' else 'o-', label=name, lw=2 if name == 'full' else 1)
+    ax.set(xlabel='warning alarms per non-converter person-year (test)', ylabel='sensitivity at >= 90 d lead',
+           title='Early-warning operating curve')
+    ax.legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out, 'lead_vs_budget.png'), dpi=120)
     plt.close('all')
 
 
@@ -179,9 +257,13 @@ def write_report(path, res, args_str):
           table({'clean': main, **res['robustness']}, KEY, ref='clean'), '',
           '## Fairness (E8): by skin_ita tercile', '',
           table({k: v for k, v in res['fairness'].items()}, ['n_people', 'n_converters', *KEY]), '',
-          '## Example evidence ledger (first warning of a warned converter)', '']
+          '## Early-warning operating curve: sensitivity at >= 90 d lead (alarms/non-converter-yr) per warning budget', '',
+          '| budget | ' + ' | '.join(res['operating_curve']) + ' |', '|---' * (len(res['operating_curve']) + 1) + '|']
+    L += [f'| {b} | ' + ' | '.join(f"{_f(c[b]['sens_lead_90'])} ({_f(c[b]['alarms_per_nonconv_py'])})"
+                                    for c in res['operating_curve'].values()) + ' |' for b in BUDGETS]
+    L += ['', '## Example evidence ledger (first warning of a warned converter)', '']
     L += ['```json', json.dumps(_clean(res['ledger']), indent=2), '```'] if res['ledger'] else ['No converter was warned before t_ref in the test set.']
-    L += ['', 'Figures: `calibration.png`, `lead_time.png`, `risk_coverage.png`.', '']
+    L += ['', 'Figures: `calibration.png`, `lead_time.png`, `risk_coverage.png`, `lead_vs_budget.png`.', '']
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(L))
 
@@ -196,22 +278,42 @@ def main():
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--quick', action='store_true', help='n=150, days=360, n_boot=5')
     ap.add_argument('--out', default='results')
+    ap.add_argument('--lifesnaps', help='LifeSnaps daily_fitbit_sema_df_unprocessed.csv: real-world transfer test')
     a = ap.parse_args()
-    if not a.synthetic and not (a.daily and a.people):
-        ap.error('give --synthetic or both --daily and --people')
+    if not a.synthetic and not (a.daily and a.people) and not a.lifesnaps:
+        ap.error('give --synthetic, both --daily and --people, or --lifesnaps')
     n, days, n_boot = (150, 360, 5) if a.quick else (a.n, a.days, BASE['n_boot'])
-    daily, people = data.make_cohort(n, days, a.seed) if a.synthetic else data.load_csv(a.daily, a.people)
+    daily, people = data.load_csv(a.daily, a.people) if a.daily else data.make_cohort(n, days, a.seed)
     split = make_split(people, a.seed)
     tp = people[people.pid.isin(split['test'])]
     cfg = {**BASE, 'n_boot': n_boot, 'seed': a.seed}
     os.makedirs(a.out, exist_ok=True)
 
     dec, wk, models, th = pipeline(daily, people, split, cfg)
-    res = {'main': metrics(dec, tp), 'thresholds': th, 'ablations': {}, 'robustness': {}}
-    decs = {'full': dec}
-    for name, over in ABLATIONS.items():
-        decs[name] = pipeline(daily, people, split, {**cfg, **over})[0]
-        res['ablations'][name] = metrics(decs[name], tp)
+    if a.lifesnaps:
+        from sentinel.lifesnaps import load_lifesnaps
+        nc = tp[~tp.converter.astype(bool)]
+        d_nc = learn.quality_gate(daily[daily.pid.isin(nc.pid)])
+        res = {'synthetic_nonconverters': usage(dec[dec.pid.isin(nc.pid)], wk[wk.pid.isin(nc.pid)], d_nc, nc),
+               'lifesnaps': real_world(*load_lifesnaps(a.lifesnaps), cfg, (models, th)), 'thresholds': th}
+        with open(os.path.join(a.out, 'real_world.json'), 'w') as f:
+            json.dump(_clean(res), f, indent=2)
+        cols = list(res['lifesnaps'])
+        md = ['# Real-world transfer test: LifeSnaps vs synthetic non-converters', '',
+              f'Model and thresholds trained on synthetic data (n={n}, days={days}, seed={a.seed}); context and population',
+              'prior refitted on LifeSnaps (label-free). LifeSnaps has no BP labels: all participants count as non-converters.', '',
+              '| metric | synthetic non-converters | LifeSnaps |', '|---|---|---|']
+        md += [f'| {k} | {_f(res["synthetic_nonconverters"][k])} | {_f(res["lifesnaps"][k])} |' for k in cols]
+        open(os.path.join(a.out, 'real_world.md'), 'w', encoding='utf-8').write('\n'.join(md) + '\n')
+        print('\n'.join(md))
+        return
+    res = {'main': metrics(dec, tp), 'thresholds': th, 'weights': models['weights'], 'trend_r': models['trend_r'],
+           'ablations': {}, 'robustness': {}}
+    abl = {name: pipeline(daily, people, split, {**cfg, **over}) for name, over in ABLATIONS.items()}
+    decs = {'full': dec, **{k: v[0] for k, v in abl.items()}}
+    res['ablations'] = {k: metrics(v[0], tp) for k, v in abl.items()}
+    fits = {'full': (dec, models), **{k: (abl[k][0], abl[k][2]) for k in ('level_only', 'cuff_only')}}
+    res['operating_curve'] = operating_curve(fits, people, split)
     for name, pt in ROBUSTNESS.items():
         res['robustness'][name] = metrics(pipeline(daily, people, split, cfg, (models, th), pt)[0], tp)
     res['fairness'] = by_group(dec, tp, 'skin_ita', 3).to_dict('index')
@@ -220,7 +322,7 @@ def main():
     with open(os.path.join(a.out, 'metrics.json'), 'w') as f:
         json.dump(_clean(res), f, indent=2)
     write_report(os.path.join(a.out, 'report.md'), res, f'n={n}, days={days}, seed={a.seed}, n_boot={n_boot}')
-    figures(a.out, dec, decs, tp)
+    figures(a.out, dec, decs, tp, res['operating_curve'])
 
     m = res['main']
     print(f'SENTINEL-HTN ({n} people, {days} days; test {m["n_people"]} people, {m["n_converters"]} converters)')
@@ -229,7 +331,9 @@ def main():
           f'median lead {_f(m["median_lead"])} d')
     print(f'  alarms/non-converter-yr {_f(m["alarms_per_nonconv_py"])}  warning precision {_f(m["warning_precision"])}  '
           f'AURC {_f(m["aurc"])}  abstention {_f(m["abstention_rate"])}')
-    print(f'  wrote {a.out}/metrics.json, report.md, calibration.png, lead_time.png, risk_coverage.png')
+    print('  Se@90 by warning budget ' + '  '.join(f'{k}: ' + '/'.join(_f(v['sens_lead_90']) for v in c.values())
+                                               for k, c in res['operating_curve'].items()) + f'  (budgets {BUDGETS})')
+    print(f'  wrote {a.out}/metrics.json, report.md, calibration.png, lead_time.png, risk_coverage.png, lead_vs_budget.png')
 
 
 if __name__ == '__main__':

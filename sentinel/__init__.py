@@ -15,6 +15,13 @@ RISK_SIGN = {
 }
 CHANNELS = list(RISK_SIGN)
 
+# Evidence prior per channel for the joint deviation (multiplied by a label-free reliability weight, detect.py).
+# Autonomic channels: the most direct, sympathetic-drive pathway and the largest cohort effects (low HRV: HR 1.58 for
+# incident hypertension, Kang 2022). Behavioural channels: smaller or indirect, volitional and confounded effects
+# (steps OR 0.92 per 1,000/day, Master 2022; short or irregular sleep HR 1.29 / OR 1.56, Zheng 2024). Never fitted
+# to simulated labels (the simulator's couplings would just be recovered).
+EVIDENCE = {'night_rhr': 1.0, 'night_rmssd': 1.0, 'still_hr': 1.0, 'steps': 0.5, 'sleep_dur': 0.5, 'sleep_reg': 0.5}
+
 # Slow confounders are regressed out; acute ones mask the day for night/still channels.
 SLOW_CONTEXT = ['ambient_temp', 'month', 'menses']
 ACUTE_CONTEXT = ['exercise_min', 'alcohol', 'illness']
