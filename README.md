@@ -34,6 +34,9 @@ python run.py --synthetic --quick --out results_quick      # ~15 s smoke run (to
 python run.py --synthetic --out results                     # default: 600 people, 540 days
 python run.py --synthetic --n 1200 --seed 0 --out results/seed0   # the setting behind results/summary_3seeds.md (seeds 0-2)
 python run.py --daily daily.csv --people people.csv --out results   # organiser data (schema in CONTRACT.md)
+python run.py --lifesnaps rais_anonymized/csv_rais_anonymized/daily_fitbit_sema_df_unprocessed.csv --n 1200 --out results/lifesnaps
+#   real-world transfer test on LifeSnaps (71 people, 4 months, Fitbit; kaggle datasets download -d skywescar/lifesnaps-fitbit-dataset):
+#   no BP labels, so it reports real coverage, abstention and false-alarm rates next to synthetic non-converters
 python tests/test_pipeline.py                               # end-to-end test (400 people, ~10 s)
 python -m sentinel.evaluate                                 # metric self-check against hand-computed values
 ```
