@@ -222,7 +222,7 @@ E robustness, F uncertainty quality (AURC, abstention rate). "specificity" is cu
 | `CONTRACT.md` | data schema and module APIs (use it to plug in the organiser dataset) |
 | `results/` | all reported results; paper numbers in `results/pulse/` and `results/weighted/` |
 | `paper/` | IEEE paper (`main.tex`) and `make_figures.py` |
-| `panel/`, `debate/`, `review/` | the evidence base, expert-panel audits and mock reviews behind the design (`panel/pulse_audit_doctor.md`) |
+| `panel/`, `review/` | expert-panel audits and mock reviews behind the design (`panel/pulse_audit_doctor.md`) |
 
 Raw data (`data/`), third-party code and weights (`external/`) and virtualenvs are never committed.
 
