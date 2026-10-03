@@ -20,36 +20,54 @@ cuff for a week".
 
 ![SENTINEL-HTN architecture](paper/figures/fig_architecture.png)
 
+### Full system overview
+
+Solid arrows run on every person-week. Dashed parts are optional and off by default: the core never imports them.
+
 ```mermaid
 flowchart LR
     subgraph IN["Inputs"]
-        S["Wrist strap<br/>night HR, RMSSD, resting HR,<br/>steps, sleep, SQI"]
-        P["Phone context<br/>temperature, month, menses,<br/>alcohol, illness"]
-        C["Sparse home cuff"]
+        S["Wrist strap<br/>night HR, night RMSSD, resting HR,<br/>steps, sleep duration and regularity,<br/>SQI, irregular-rhythm flag, firmware"]
+        P["Phone context<br/>temperature, month, menses,<br/>exercise minutes, alcohol, illness"]
+        C["Sparse home cuff<br/>SBP / DBP readings"]
+        PPG["Nightly raw PPG clips<br/>(optional)"]
+        HW["Hourly phone and watch data<br/>(optional)"]
     end
-    subgraph FM["Optional frozen encoders - off by default"]
-        PG["PaPaGei-S<br/>PPG clip → 512-d → pulse_htn"]
-        WB["WBM<br/>hourly week 168x38 → 256-d"]
+    subgraph FM["Optional frozen foundation-model encoders"]
+        PG["PaPaGei-S encoder<br/>PPG clip to 512-d"]
+        PH["Hypertension head<br/>trained on PPG-BP"]
+        WB["WBM encoder<br/>hourly week 168x38 to 256-d"]
+        WD["Behaviour drift channel<br/>(planned)"]
     end
-    Q["Quality gate<br/>SQI, rhythm, acute masks<br/>RQ5"]
-    L["1 Learn<br/>context regression,<br/>shrinkage personal baseline<br/>RQ1 RQ4"]
-    D["2 Detect<br/>evidence-weighted weekly deviation,<br/>CUSUM, 4-of-6 persistence, Kalman trend<br/>RQ2"]
-    PR["3 Predict<br/>26-week landmark risk,<br/>bootstrap band, Platt calibration<br/>RQ3"]
-    W["4 Warn<br/>alarm budget, evidence ledger<br/>RQ6"]
+    subgraph CORE["Core pipeline: NumPy, pandas, SciPy only"]
+        Q["Quality gate<br/>valid days, acute masks<br/>RQ5"]
+        L["1 Learn<br/>context adjustment,<br/>personal baseline, z-scores<br/>RQ1 RQ4"]
+        D["2 Detect<br/>weighted weekly deviation,<br/>CUSUM, 4-of-6 persistence,<br/>Kalman trend<br/>RQ2"]
+        PR["3 Predict<br/>26-week landmark risk,<br/>bootstrap band, Platt calibration<br/>RQ3"]
+        W["4 Warn<br/>three states, alarm budget,<br/>evidence ledger<br/>RQ6"]
+    end
+    subgraph OUT["Output per person-week"]
+        WA["WARNING<br/>measure with a home cuff for 7 days"]
+        IS["INSUFFICIENT<br/>keep monitoring"]
+        PQ["POOR_QUALITY<br/>abstain"]
+        LED["Evidence ledger<br/>weeks exceeded, channels,<br/>risk band, data quality"]
+    end
+    subgraph AG["Optional agent audit layer: run.py --agents"]
+        A1["Profiler"] --> A2["Predictor"] --> A3["Auditor"]
+    end
     S --> Q
     P --> Q
-    C --> PR
     Q --> L --> D --> PR --> W
-    PG -. extra channel .-> L
-    WB -. planned channel .-> L
-    W --> WA["WARNING<br/>7-day cuff series"]
-    W --> IS["INSUFFICIENT<br/>keep monitoring"]
-    W --> PQ["POOR_QUALITY<br/>abstain"]
-    subgraph AG["Optional agent audit layer (--agents) - off by default"]
-        AP["Profiler → Predictor → Auditor<br/>on each prompt"]
-    end
-    W -. prompts .-> AP
-    AP -. "veto: whole episode<br/>WARNING → INSUFFICIENT" .-> IS
+    C --> PR
+    PPG -.-> PG -.-> PH -. "pulse_htn channel" .-> L
+    HW -.-> WB -.-> WD -.-> L
+    W --> WA
+    W --> IS
+    W --> PQ
+    W --> LED
+    W -. "each prompt" .-> A1
+    A3 -. "approve" .-> WA
+    A3 -. "veto: whole episode" .-> IS
 ```
 
 | Stage | File | Research question | What it does |
@@ -62,6 +80,74 @@ flowchart LR
 
 `sentinel/data.py` holds the synthetic cohort (calibrated to LifeSnaps), the CSV loader and the perturbations. The
 interfaces are fixed in `CONTRACT.md`.
+
+### Training and deployment
+
+```mermaid
+flowchart LR
+    COH["Cohort<br/>synthetic, or organiser CSV"] --> SP{"Subject-grouped split<br/>stratified by converter"}
+    SP -- "60%" --> FIT["Fit people<br/>context coefficients, population prior,<br/>channel weights, persistence threshold,<br/>trend noise, risk model"]
+    SP -- "20%" --> CAL["Calibration people<br/>Platt calibration, warning threshold,<br/>sensitivity-at-specificity threshold"]
+    SP -- "20%" --> TEST["Test people<br/>scored only, clean and perturbed"]
+    FIT --> LOCK["Locked model<br/>plus per-user state"]
+    CAL --> LOCK
+    LOCK --> TEST
+    LOCK --> DEP["Deployment<br/>phone updates each person's state,<br/>a few vector operations per night"]
+```
+
+### Inside the core pipeline
+
+```mermaid
+flowchart TB
+    subgraph QG["Quality gate: learn.quality_gate"]
+        q1["valid day: SQI at least 0.6, no irregular rhythm,<br/>at least one channel present"]
+        q2["acute context: exercise over 45 min, alcohol or illness<br/>masks night HR, RMSSD, resting HR and pulse that night"]
+        q1 --> q2
+    end
+    subgraph LE["1 Learn: learn.py"]
+        l1["fit_context: pooled least squares on temperature,<br/>sin and cos of month, menses, giving x_adj"]
+        l2["fit_prior: population mean mu0, between-person tau,<br/>within-person sigma, from fit people's first 56 days"]
+        l3["personal_baseline: normal-normal posterior m_i, v_i<br/>from the first 28 valid days, restarted on a firmware change"]
+        l4["z = sign x (x_adj - m_i) / sqrt(sigma^2 + v_i), clipped to +-6"]
+        l1 --> l2 --> l3 --> l4
+    end
+    subgraph DE["2 Detect: detect.py"]
+        d1["weekly mean z per channel, at least 3 days<br/>evaluable week: at least 4 valid days"]
+        d2["joint deviation: weighted mean of channel z<br/>weight = literature prior / variance, never fitted to labels"]
+        d3["CUSUM: S = max(0, S + dev - 0.25)"]
+        d4["persistence: dev over theta in 4 of the last 6 evaluable weeks<br/>theta set to 2 episodes per non-converter year (watch tier)"]
+        d5["Kalman local linear trend<br/>slope and slope z, causal"]
+        d1 --> d2
+        d2 --> d3
+        d2 --> d4
+        d2 --> d5
+    end
+    subgraph PRE["3 Predict: predict.py"]
+        p1["one landmark row per person-week until t_ref<br/>label: t_ref within the next 26 weeks"]
+        p2["features: level (age, sex, BMI, resting HR, last cuff and its age)<br/>change (deviation, 12-week slope, CUSUM, persistence, trend)<br/>quality (valid days in 30)"]
+        p3["ridge logistic regression, each person weighs 1, L2 = 10"]
+        p4["20 person-level bootstrap refits<br/>band p_lo, p_hi = 10th and 90th percentiles"]
+        p5["Platt calibration on out-of-fold and calibration scores<br/>slope kept non-negative"]
+        p1 --> p2 --> p3 --> p4 --> p5
+    end
+    subgraph WR["4 Warn: warn.py"]
+        w1{"at least 15 valid days<br/>in the last 30?"}
+        w2{"p_lo at least theta_p<br/>AND persistence?"}
+        w1 -- no --> wq["POOR_QUALITY"]
+        w1 -- yes --> w2
+        w2 -- yes --> ww["WARNING<br/>theta_p set to 0.5 episodes<br/>per non-converter year"]
+        w2 -- no --> wi["INSUFFICIENT"]
+        ww --> w3["evidence ledger, prompts with a<br/>26-week refractory (burden metric)"]
+    end
+    CUFF["home cuff readings"] --> p2
+    q2 --> l1
+    l4 --> d1
+    d3 --> p2
+    d4 --> p2
+    d5 --> p2
+    d4 --> w2
+    p5 --> w1
+```
 
 ### The three states
 
@@ -94,6 +180,45 @@ unchanged without them and never imports torch.
 - **WBM** from OpenMHC (`sentinel/wbm.py`): hourly week of 19 phone/watch channels plus missingness flags (168 x 38)
   -> 256-d. Probed on real LifeSnaps data; its drift channel is planned, not yet in the pipeline.
 
+Both are encoder-only: a frozen pretrained encoder turns a signal into an embedding, and a small head trained here
+reads it. Nothing is decoded and no encoder weight is changed.
+
+**PaPaGei-S: pulse shape** (`python -m sentinel.pulse`, separate CPU environment)
+
+```mermaid
+flowchart LR
+    subgraph TEST["Real-label test: PPG-BP, 219 people, one cuff reading each"]
+        c1["3 fingertip PPG clips<br/>2.1 s at 1 kHz"] --> c2["preprocessing: z-score,<br/>band-pass 0.5-12 Hz, 50 ms smoothing,<br/>resample to 125 Hz, pad to 10 s"]
+        c2 --> c3["PaPaGei-S encoder, frozen<br/>1D ResNet mixture-of-experts, 18 blocks"]
+        c3 --> c4["512-d embedding per clip<br/>mean of the 3 clips per person"]
+        c4 --> c5["L2 logistic head<br/>label: SBP at least 120"]
+        DEMO["age, sex, BMI"] --> c5
+        c5 --> c6["20 x 5-fold subject-level CV<br/>demographics 0.70, embeddings 0.70,<br/>both 0.75 (gain +0.05, CI -0.01 to +0.10)"]
+    end
+    subgraph CH["As a pipeline channel: with_pulse variant"]
+        n1["clean nightly wrist clips, up to 10 s"] --> n2["same preprocessing<br/>and frozen encoder"] --> n3["head logit per clip"] --> n4["nightly median = pulse_htn<br/>risk sign +1, evidence prior 0.5"] --> n5["enters Learn<br/>like any other channel"]
+    end
+    c5 -. "saved head" .-> n3
+    n5 --> R["simulator: no early-warning gain<br/>at matched alarm rates, so off by default"]
+```
+
+**WBM: behaviour** (`python -m sentinel.wbm [--no-energy]`, CUDA GPU environment)
+
+```mermaid
+flowchart LR
+    subgraph PROBE["Real-data probe: LifeSnaps, 68 Fitbit users, 606 person-weeks"]
+        h1["hourly Fitbit export"] --> h2["map to WBM channels: steps, distance,<br/>heart rate, active energy<br/>the other 15 channels flagged missing"]
+        h2 --> h3["keep weeks with at least 84 worn hours<br/>168 hours x (19 values + 19 missing flags)"]
+        h3 --> h4["normalise with WBM's own statistics"]
+        h4 --> h5["WBM encoder, frozen<br/>Mamba-2, 6.4M parameters, OpenMHC weights"]
+        h5 --> h6["256-d embedding per week<br/>mean per person"]
+        h6 --> h7["L2 logistic probe vs 6 hand-made features<br/>20 x 5-fold CV, 200 permutations"]
+        h7 --> h8["sex 0.76 vs 0.66, no age signal<br/>BMI only through the calorie channel: a leak, removed"]
+    end
+    h6 -. "planned" .-> PL["drift channel: weekly distance<br/>from the person's baseline embedding, into Learn"]
+    h6 -.-> NC["matched-cohort negative control<br/>LifeSnaps x PPG-BP borrowed labels (matched.py)"]
+```
+
 ### Optional agent audit layer
 
 `sentinel/agents.py` (`run.py --agents`, main model only) mirrors the stages with three agents: a **Profiler**
@@ -103,6 +228,37 @@ purpose is traceability (every claim cites a field of the record) and a conserva
 discrimination: the only allowed change is downgrading a whole WARNING episode to INSUFFICIENT, enforced in code.
 Only a deterministic template backend exists (no API key). On the simulator its one live check (acute-context
 confounding) vetoes many prompts at a real cost in early detections; see `results/agents/summary.md`.
+
+```mermaid
+flowchart TB
+    DEC["Warn output: decision table"] --> PRM["warn.prompts: WARNING episode starts outside<br/>the 26-week refractory, not yet audited"]
+    TOOLS["pipeline tools: warn.ledger, weekly table,<br/>personal_baseline(moments=True)"] -.-> PF
+    PRM --> PF
+    subgraph CASE["One audit case: records are plain dicts, every claim cites a field"]
+        PF["Profiler: Learn + Detect<br/>facts only: data quality, deviation, persistence,<br/>channel z, usual range m_i +- 2 sqrt(sigma^2 + v_i)"]
+        PD["Predictor: Predict<br/>copies p, p_lo, p_hi, theta_p and past cuff readings,<br/>proposes a state, gives cited reasons"]
+        AU["Auditor: Warn gate<br/>6 checks computed in code"]
+        PF --> PD --> AU
+        AU -- "only refs_resolve failed" --> RET["return once: drop reasons<br/>whose reference does not resolve"]
+        RET --> AU
+    end
+    BK["backend: deterministic templates<br/>LLM backend is a stub"] -.-> CASE
+    AU -- approve --> KEEP["WARNING kept"]
+    AU -- veto --> VETO["apply_vetoes: the whole episode<br/>WARNING to INSUFFICIENT"]
+    VETO --> INV["check_invariants: no upgrade, POOR_QUALITY untouched,<br/>no split episode, no new episode start"]
+    INV -- "recompute prompts, audit new ones until none" --> PRM
+    KEEP --> OUTS["outputs: metrics.json agents block,<br/>agent_records.json, ledger agents key, report.md section"]
+    INV --> OUTS
+```
+
+| Auditor check | Rule | On a WARNING row | If it fails |
+|---|---|---|---|
+| `quality_gate` | at least 15 valid days in the last 30 | passes by construction | veto |
+| `risk_gate` | p_lo at least theta_p | passes by construction | veto |
+| `persistence` | at least 4 of the last 6 evaluable weeks above threshold | passes by construction | veto |
+| `refs_resolve` | record well formed, every reference resolves, at least one reason | template cannot break it | return once, then approve or veto |
+| `no_bp_number` | no mmHg, "128/84", "SBP 140" or diagnostic wording in any text | template cannot break it | veto |
+| `context_confound` | fails if 3 of the last 6 weeks each have at least 3 acute-context masked days (fixed, never tuned) | the only check that can fail | veto |
 
 ## Data and validation
 
@@ -229,6 +385,35 @@ E robustness, F uncertainty quality (AURC, abstention rate). "specificity" is cu
 (non-converters never prompted), not a single-window specificity.
 
 ## Repository layout
+
+```mermaid
+flowchart LR
+    RUN["run.py<br/>CLI: main model, ablations, robustness,<br/>fairness, operating curve, report"]
+    INIT["sentinel/__init__.py<br/>channels, risk signs, evidence priors, states"]
+    DATA["data.py<br/>simulator, CSV loader, perturbations"]
+    LEARN["learn.py"] --> DET["detect.py"] --> PRED["predict.py"] --> WARN["warn.py"]
+    EVAL["evaluate.py<br/>metrics A-F"]
+    LS["lifesnaps.py<br/>real-data adapter"]
+    RN["realnoise.py<br/>noise transplant, plasmode"]
+    AGT["agents.py<br/>audit layer"]
+    PUL["pulse.py<br/>PaPaGei, torch, CPU env"]
+    WBMm["wbm.py<br/>WBM, GPU env"]
+    MAT["matched.py<br/>negative control"]
+    RES[("results/")]
+    PAP["paper/<br/>main.tex, make_figures.py"]
+    RUN --> DATA
+    RUN --> LEARN
+    RUN --> EVAL
+    RUN --> LS
+    RUN -. "--noise-csv" .-> RN
+    RUN -. "--agents" .-> AGT
+    INIT --- LEARN
+    RUN --> RES
+    PUL -. "own entry point" .-> RES
+    WBMm -. "own entry point" .-> RES
+    MAT -.-> RES
+    RES --> PAP
+```
 
 | Path | Contents |
 |---|---|
