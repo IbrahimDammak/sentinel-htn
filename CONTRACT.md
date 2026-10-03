@@ -84,6 +84,8 @@ reference or NaN), onset (float day true drift began — SYNTHETIC ONLY, never a
   - `personal=False` ablation: m_i = mu0, v_i = tau².
   - Also returns `valid`, `ctx_masked`, and bool `baseline_ready` (False during warm-up).
   - A firmware change restarts the warm-up.
+  - `moments=True` also returns `<ch>_m` (m_i) and `<ch>_v` (v_i), the values z uses, on the context-adjusted
+    scale (for `agents.py`'s usual range only). Off by default; z is identical either way.
 
 ### detect.py — DETECT (RQ2 persistence, RQ4)
 - `channel_weights(wk, evidence) -> {ch: weight}`: label-free reliability (1 / variance of the weekly channel mean z on evaluable weeks) times the literature prior `EVIDENCE` (sentinel/__init__.py). Never fitted to labels. A channel without a usable variance gets weight 0, never NaN; `weekly` treats a channel missing from `weights` as 0.
@@ -196,6 +198,48 @@ reference or NaN), onset (float day true drift began — SYNTHETIC ONLY, never a
 - Writes `results/metrics.json`, `results/report.md` (tables plus one example evidence ledger) and figures
   (calibration curve, lead-time histogram, risk–coverage).
 
+### agents.py — optional three-agent audit layer (`run.py --agents`; imported lazily, numpy/pandas only)
+Purpose: traceability and a conservative second check, **not** better discrimination. Runs after Warn on the main
+model only (not ablations, robustness, fairness reruns, LifeSnaps transfer or with_pulse). The pipeline is the source
+of truth: agents copy pipeline numbers (`warn.ledger`, the decision row, `personal_baseline(moments=True)`) and add
+no maths except the usual range m_i ± 2·sqrt(sigma² + v_i).
+- Audited rows: `warn.prompts(dec)`. Vetoes are applied, `prompts()` is recomputed on the audited states (a vetoed
+  prompt starts no refractory period) and new prompts are audited until none appear (`audit_loop`).
+- Safety, enforced in code (`apply_vetoes`, `check_invariants`, asserted on every run): the only change is
+  WARNING → INSUFFICIENT; never an upgrade; POOR_QUALITY never created or removed; a veto downgrades the WHOLE
+  WARNING episode (contiguous WARNING rows from its start), so it can neither split an episode nor add a start.
+- Backend = dict of three text functions (`profile`, `predict`, `audit`) that write only narrative fields. Code copies
+  every number, computes every check and the verdict, and keeps the stricter of its verdict and the backend's.
+  `template_backend()` (deterministic, no API key) is the only implementation; `llm_backend()` raises
+  NotImplementedError.
+- Records (plain dicts, `validate()` against `PROFILE_SPEC`, `PREDICTOR_SPEC`, `AUDITOR_SPEC`). Every claim is
+  `{claim, ref}` with `ref` a dotted path into `{'profile': <Profiler>, 'predictor': <Predictor>}`:
+  - Profiler: pid, week, quality {valid_days_30, n_eval, ctx_masked_6w, ctx_masked_weekly, verdict ∈ {adequate,
+    marginal} (marginal = valid_days_30 < 21 or n_eval < 6; descriptive only)}, deviation {dev, cusum,
+    weeks_exceeded [n_exceed, n_eval], dev_slope12, trend_z, persist}, drivers [{channel, mean_z_6w, toward_risk}],
+    usual_range {channel: [lo, hi]}, concerns [{claim, ref}], summary. Facts only: no state, no risk opinion.
+  - Predictor: pid, week, p, p_lo, p_hi, thr_p (copied), cuff {sbp_last, dbp_last, days_since} (the person's own past
+    readings, input only), pipeline_state, imputed_inputs, proposed_state ∈ {pipeline state, INSUFFICIENT},
+    agrees_with_pipeline, reasons, band_drivers (existing fields only: band ends, imputed inputs, evaluable weeks; no
+    attribution computed), action ("Take home-cuff readings for 7 days.").
+  - Auditor: pid, week, checks [{name, pass, detail}], verdict ∈ {approve, return_once, veto}, final_state,
+    rationale. Checks: quality_gate (valid_days_30 ≥ 15), risk_gate (p_lo ≥ thr_p), persistence (n_exceed ≥ 4 of
+    the last 6 weeks), refs_resolve (well-formed, every ref resolves, ≥ 1 reason), no_bp_number (no BP number or
+    diagnostic wording in any free text), context_confound (fails if ≥ 3 of the last 6 weeks each have ≥ 3
+    acute-context masked days; fixed, never tuned). Any failure except refs_resolve → veto; refs_resolve alone →
+    return_once: the reasons whose ref failed are dropped (in code) and the Auditor re-checks once → approve or veto.
+  - For WARNING rows quality_gate, risk_gate and persistence pass by construction (decide() guarantees them) and the
+    template backend cannot produce broken refs or BP numbers: invariant checks. On synthetic data context_confound
+    is the only check that can veto; the simulator's illness/alcohol effects sit only on days the quality gate
+    already masks, so its vetoes there are expected to be pure cost.
+- `compare(dec0, dec1, cases, tp, cal, chance)` → metrics.json `agents`: before/after alarms_per_nonconv_py,
+  prompts_per_nonconv_py_r26, sens_lead_0/30/90, sens_post_onset_30, chance floors at each table's own alarm rate;
+  counts (prompts audited, vetoes, converters losing their first warning, non-converters spared, …); every lost
+  early detection; vetoes by skin_ita tercile; failed-check distribution. No agreement rate (100% by construction).
+- With `--agents` off, `ledger()`, metrics.json, report.md and every other output are unchanged. With it on,
+  `res['main']` stays pre-audit; the `agents` block, `ledger['agents']`, a report section and `agent_records.json`
+  are added. `python -m sentinel.agents --summary DIR` writes DIR/summary.md over DIR/seed*/metrics.json.
+
 ### tests/test_pipeline.py
 Plain asserts, runnable with `python tests/test_pipeline.py` on a small cohort (n=150, days=360). It checks that:
 - the states are ⊂ STATES and STATES contains no 'STABLE'
@@ -205,6 +249,10 @@ Plain asserts, runnable with `python tests/test_pipeline.py` on a small cohort (
 - the metrics keys exist
 - the default run has no pulse channel; with pulse on it gets a weight; an all-NaN pulse column with pulse on
   gives exactly the default decisions
+- agents: moments leave every z unchanged; 1,000 seeded random decision tables through `audit_loop` never upgrade,
+  never touch POOR_QUALITY and every veto removes a whole episode; same input → identical records; a broken ref is
+  returned once and dropped (veto if nothing remains); a BP number is vetoed; `--agents` off = the agents run minus
+  every agent key and report section
 
 ### pulse.py — optional PPG embeddings (torch; not imported by the core)
 - PPG-BP experiment (`python -m sentinel.pulse`): PaPaGei reproduction; repeated-CV demographics vs embeddings for
