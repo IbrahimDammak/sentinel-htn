@@ -7,3 +7,7 @@ debate/audit/packets/
 
 # downloaded datasets (LifeSnaps etc.) — never committed
 data/
+
+# third-party code/weights (PaPaGei) and local virtualenv — never committed
+external/
+.venv/

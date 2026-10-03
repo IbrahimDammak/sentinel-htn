@@ -23,9 +23,10 @@ plt.rcParams.update({'font.size': 7.5, 'font.family': 'serif', 'axes.linewidth':
 
 
 def architecture():
-    """Fig. 1 — Learn -> Detect -> Predict -> Warn pipeline (full text width)."""
-    fig, ax = plt.subplots(figsize=(7.16, 1.7))
-    ax.set(xlim=(0, 100), ylim=(0, 22)); ax.axis('off')
+    """Fig. 1 — Learn -> Detect -> Predict -> Warn pipeline with optional frozen foundation-model encoders (full width)."""
+    fig, ax = plt.subplots(figsize=(7.16, 2.45))
+    ax.set(xlim=(0, 100), ylim=(0, 32)); ax.axis('off')
+    Y = 11.5  # main row sits above the encoder row
     boxes = [  # x, title, subtitle, lines, face
         (0.5, 'Inputs', '', 'wrist PPG + IMU\nsleep, steps,\ncontext, sparse\nhome cuff', '#eeeeee'),
         (15.5, 'Quality gate', '(RQ5)', 'SQI threshold\nrhythm gate\nacute-context\nmasks', '#eeeeee'),
@@ -35,18 +36,29 @@ def architecture():
         (75.5, '4 Warn', '(RQ6)', 'three states,\nalarm budget,\nevidence\nledger', '#dcd8f5'),
     ]
     for x, t, sub, body, fc in boxes:
-        ax.add_patch(FancyBboxPatch((x, 3.5), 13.5, 16, boxstyle='round,pad=0.3,rounding_size=0.8', fc=fc, ec='#555', lw=0.6))
-        ax.text(x + 6.75, 17.6, t, ha='center', va='center', weight='bold', fontsize=6.4)
-        ax.text(x + 6.75, 15.4, sub, ha='center', va='center', fontsize=5.4, color='#444')
-        ax.text(x + 6.75, 9.0, body, ha='center', va='center', fontsize=5.4, linespacing=1.2)
+        ax.add_patch(FancyBboxPatch((x, 3.5 + Y), 13.5, 16, boxstyle='round,pad=0.3,rounding_size=0.8', fc=fc, ec='#555', lw=0.6))
+        ax.text(x + 6.75, 17.6 + Y, t, ha='center', va='center', weight='bold', fontsize=6.4)
+        ax.text(x + 6.75, 15.4 + Y, sub, ha='center', va='center', fontsize=5.4, color='#444')
+        ax.text(x + 6.75, 9.0 + Y, body, ha='center', va='center', fontsize=5.4, linespacing=1.2)
     for x in (14.2, 29.2, 44.2, 59.2, 74.2):
-        ax.annotate('', (x + 1.1, 12), (x - 0.2, 12), arrowprops=dict(arrowstyle='->', lw=0.7))
+        ax.annotate('', (x + 1.1, 12 + Y), (x - 0.2, 12 + Y), arrowprops=dict(arrowstyle='->', lw=0.7))
     for i, (s, c) in enumerate([('WARNING', '#c7e9dc'), ('INSUFFICIENT', '#f2f2f2'), ('POOR_QUALITY', '#f2f2f2')]):
-        y = 16 - 5.2 * i
+        y = 16 - 5.2 * i + Y
         ax.add_patch(FancyBboxPatch((90.9, y - 1.7), 8.9, 3.4, boxstyle='round,pad=0.2,rounding_size=0.5', fc=c, ec='#555', lw=0.5))
         ax.text(95.35, y, s, ha='center', va='center', fontsize=4.9)
-        ax.annotate('', (91.0, y), (89.5, 12), arrowprops=dict(arrowstyle='->', lw=0.5))
-    ax.text(95.35, 1.8, 'warning -> 7-day\nhome-cuff series', ha='center', va='center', fontsize=5.4, style='italic')
+        ax.annotate('', (91.0, y), (89.5, 12 + Y), arrowprops=dict(arrowstyle='->', lw=0.5))
+    ax.text(95.35, 1.8 + Y, 'warning -> 7-day\nhome-cuff series', ha='center', va='center', fontsize=5.4, style='italic')
+    # optional frozen encoders (dashed): their outputs enter Learn as extra channels
+    for x, t, body in [(0.5, 'PaPaGei-S (frozen)', 'PPG clip -> 512-d -> hypertension\nhead logit = nightly pulse channel'),
+                       (30.5, 'WBM (frozen)', 'hourly week 168 x 38 -> 256-d\nembedding = behaviour channel')]:
+        ax.add_patch(FancyBboxPatch((x, 0.6), 27.5, 8.4, boxstyle='round,pad=0.3,rounding_size=0.8', fc='#fbeee8',
+                                    ec='#555', lw=0.6, ls='--'))
+        ax.text(x + 13.75, 7.0, t, ha='center', va='center', weight='bold', fontsize=6.0)
+        ax.text(x + 13.75, 3.4, body, ha='center', va='center', fontsize=5.2, linespacing=1.2)
+    ax.annotate('', (33.5, 3.0 + Y), (28.4, 6.5), arrowprops=dict(arrowstyle='->', lw=0.6, ls='--'))
+    ax.annotate('', (37.25, 3.0 + Y), (37.25, 9.4), arrowprops=dict(arrowstyle='->', lw=0.6, ls='--'))
+    ax.text(61.0, 4.8, 'optional, frozen, never trained here;\nreal-label probes in Results', ha='left', va='center',
+            fontsize=5.4, style='italic', color='#444')
     fig.savefig(os.path.join(OUT, 'fig_architecture.pdf'), bbox_inches='tight')
 
 

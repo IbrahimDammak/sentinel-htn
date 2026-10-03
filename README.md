@@ -26,6 +26,15 @@ assessment. The clinical reference `t_ref` is the first of two consecutive home-
 
 `sentinel/data.py` holds the synthetic cohort, the CSV loader and the perturbations. The interfaces are fixed in `CONTRACT.md`.
 
+Optional pulse-wave channel (`sentinel/pulse.py`): `pulse_htn`, the nightly median of a hypertension head on frozen
+PaPaGei-S embeddings of clean night PPG clips, an ordinary daily column for the pipeline (evidence prior 0.5:
+cross-sectional evidence only). It is OFF by default (the main model equals results/weighted); the `with_pulse`
+variant reports it next to the main model, compared at matched alarm rates and next to a zero-coupling arm
+(`--pulse-coupling`). At matched alarm rates it did not improve discrimination or early detection, and its
+differences from the main model are the size of those of a zero-coupling (pure-noise) arm (`results/pulse/summary.md`,
+`results/pulse/coupling_sweep.md`). When it is
+absent or all-NaN (LifeSnaps, summary-only exports) every stage runs exactly as without it.
+
 ## Run
 
 ```
@@ -39,10 +48,30 @@ python run.py --lifesnaps rais_anonymized/csv_rais_anonymized/daily_fitbit_sema_
 #   no BP labels, so it reports real coverage, abstention and false-alarm rates next to synthetic non-converters
 python tests/test_pipeline.py                               # end-to-end test (400 people, ~10 s)
 python -m sentinel.evaluate                                 # metric self-check against hand-computed values
+python run.py --synthetic --n 1200 --seed 0 --out results/pulse/seed0   # main + with_pulse variant (seeds 0-2), then:
+python run.py --summary results/pulse --ref results/weighted              # mean +- SD; main must equal results/weighted
+python run.py --synthetic --n 1200 --seed 0 --pulse-coupling 0 --out results/pulse/coupling_0/seed0   # coupling sweep
+python run.py --sweep results/pulse/coupling_0 results/pulse results/pulse/coupling_2x --out results/pulse
 ```
 
+Optional PPG embeddings (only for `sentinel/pulse.py`; the core never imports torch). In a separate virtualenv:
+
+```
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install pyPPG==1.0.41 --no-deps
+pip install dotmap openpyxl scikit-learn      # scikit-learn: PaPaGei reproduction and self-check only
+```
+
+It also needs PaPaGei (Nokia Bell Labs, BSD-3-Clause-Clear) cloned to `external/papagei/` with
+`weights/papagei_s.pt`, and PPG-BP (Liang et al. 2018, CC0, figshare 5459299) unpacked to `data/ppg_bp/Data File/`.
+Then `python -m sentinel.pulse` runs the self-checks and the real-data experiment (~15 min on a 6-core CPU; clip
+embeddings are cached in `data/ppg_bp/embeddings.npz`) and writes `results/ppg_bp/summary.md`, `metrics.json` and
+`head.npz`.
+`python -m sentinel.pulse --selfcheck` runs the asserts only.
+
 Current synthetic results (3 seeds, 1,200 people each): `results/summary_3seeds.md`; per-seed reports, figures and an
-example evidence ledger in `results/seed*/`.
+example evidence ledger in `results/seed*/`. With the pulse-channel variant: `results/pulse/summary.md` and
+`results/pulse/coupling_sweep.md`. Real PPG data (PPG-BP, cross-sectional): `results/ppg_bp/summary.md`.
 
 Options: `--n`, `--days`, `--seed`, `--quick` (n=150, days=360, 5 bootstrap resamples). The split is subject-grouped
 60/20/20 (fit / calibration / test), stratified by converter. Every model, threshold and calibrator is fitted on clean
@@ -52,11 +81,15 @@ fit/calibration people; robustness runs perturb only the test people's data.
 
 - `metrics.json`: main model, ablations, robustness, fairness, thresholds and an example ledger
 - `report.md`: tables for metrics A-F, ablations with deltas vs the full model, robustness, fairness by skin_ita tercile, and one evidence ledger for a warned converter
-- `calibration.png`, `lead_time.png`, `risk_coverage.png`, `lead_vs_budget.png` (sensitivity at >= 90 d lead vs warning budget for full, level_only, cuff_only)
+- `calibration.png`, `lead_time.png`, `risk_coverage.png`, `lead_vs_budget.png` (sensitivity at >= 90 d lead vs warning budget for full, level_only, cuff_only, with_pulse and chance)
 
-Metrics: A predictive (AUROC, AUPRC), B early detection (lead time, sensitivity at 0/30/90/180 days lead),
-C false-alarm burden (alarms per non-converter person-year, warning precision), D calibration (Brier, ECE),
-E robustness, F uncertainty quality (AURC, abstention rate).
+Metrics: A predictive (AUROC, AUPRC), B early detection (lead time, sensitivity at 0/30/90/180 days lead; in
+simulation also with pre-onset first warnings counted as misses), C false-alarm burden (alarms per non-converter
+person-year per calendar and per monitored year, warning precision, Kaplan–Meier probability of a first false prompt
+by 6 and 12 months, prompts per non-converter, person-level PPV at the cohort's conversion rate, and prompts per
+person-year under a 26-week repeat-suppression rule, reported as a burden figure only), D calibration (Brier, ECE),
+E robustness, F uncertainty quality (AURC, abstention rate). "specificity" is cumulative over the whole follow-up
+(non-converters never prompted), not a single-window specificity.
 
 ## The three states
 
@@ -81,6 +114,7 @@ There is no "stable" state: absence of a warning is not a claim of health.
 ## Limitations
 
 - **Synthetic data.** All results come from a simulated cohort until the organiser dataset arrives. Effect sizes, missingness and the label process are assumptions, so numbers show relative behaviour (ablations, robustness), not clinical performance. The quick cohort has very few test converters and its metrics are noisy.
-- **EM sensing is an optional pilot tier and is not in this code.** The pipeline uses only PPG-derived heart rate, HRV, activity, sleep and context channels.
+- **EM sensing is an optional pilot tier and is not in this code.** The pipeline uses only PPG-derived heart rate, HRV, activity, sleep and context channels, plus the optional pulse-wave channels.
+- **Pulse channels are validated cross-sectionally only, and are off by default.** On PPG-BP (fingertip PPG at rest, one cuff reading per person, treatment unknown) adding the embeddings to age/sex/BMI gives a suggestive gain for SBP ≥ 120 (the resampling-corrected CI includes 0); their night-to-night noise and their response to a person's own BP change are assumptions in the simulator (CONTRACT.md).
 - **No mmHg output.** The system estimates the risk of conversion, not a blood-pressure value. Home-cuff readings serve only as labels and as a level feature.
 - **Not a diagnostic.** It is a research prototype for early-warning; a warning means "get a proper cuff measurement", not a diagnosis.

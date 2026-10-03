@@ -2,8 +2,11 @@
 
   python run.py --synthetic [--n 600 --days 540 --seed 0 --quick] --out results/
   python run.py --daily d.csv --people p.csv --out results/
+  python run.py --summary results/pulse [--ref results/weighted]   # mean +- SD over results/pulse/seed*/metrics.json
+  python run.py --sweep results/pulse/coupling_0 results/pulse results/pulse/coupling_2x --out results/pulse
 """
 import argparse
+import glob
 import json
 import os
 
@@ -13,21 +16,22 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from sentinel import CHANNELS, EVIDENCE
+from sentinel import CHANNELS, EVIDENCE, PULSE, channels
 from sentinel import data, detect, learn, predict, warn
 from sentinel.evaluate import by_group, calibration_bins, lead_days, metrics, risk_coverage
 
-BASE = dict(personal=True, context=True, features='full', weights='evidence', n_boot=20, seed=0)
+# pulse OFF by default: unvalidated channels have to earn their way in (CONTRACT.md); with_pulse is a variant.
+BASE = dict(personal=True, context=True, features='full', weights='evidence', pulse=False, n_boot=20, seed=0)
 ABLATIONS = {'level_only': {'features': 'level_only'}, 'cuff_only': {'features': 'cuff_only'},
              'change_only': {'features': 'change_only'}, 'no_personalisation': {'personal': False},
              'no_context': {'context': False}, 'equal_weights': {'weights': 'equal'},
-             'reliability_only': {'weights': 'reliability'}}
+             'reliability_only': {'weights': 'reliability'}, 'with_pulse': {'pulse': True}}
 ROBUSTNESS = {'mcar_0.3': ('mcar', 0.3, {}), 'mcar_0.6': ('mcar', 0.6, {}), 'noise_1.0': ('noise', 1.0, {}),
               'drop_night_rmssd': ('drop_channel', 1.0, {'channel': 'night_rmssd'}), 'mnar_0.4': ('mnar', 0.4, {}),
               'sensor_fail_0.3': ('sensor_fail', 0.3, {})}
 BUDGETS = (0.25, 0.5, 1.0, 2.0)   # warning episodes per non-converter person-year (operating curve)
-KEY = ['auroc', 'auprc', 'sens_lead_90', 'median_lead', 'alarms_per_nonconv_py', 'warning_precision',
-       'brier', 'ece', 'aurc', 'abstention_rate']
+KEY = ['auroc', 'auprc', 'sens_spec92', 'sens_lead_0', 'sens_lead_30', 'sens_lead_90', 'median_lead', 'alarms_per_nonconv_py', 'warning_precision',
+       'specificity', 'f1', 'brier', 'ece', 'aurc', 'abstention_rate']
 
 
 def make_split(people, seed=0):
@@ -48,7 +52,7 @@ def _adjust(d, ctx):
     if ctx is not None:
         return learn.apply_context(d, ctx)
     d = d.copy()
-    for ch in CHANNELS:
+    for ch in channels(d):
         d[ch + '_adj'] = d[ch]
     return d
 
@@ -63,7 +67,7 @@ def _weights(d, prior, cfg):
     """Label-free channel weights on d (training or unlabelled real data); None = equal weights."""
     if cfg['weights'] == 'equal':
         return None
-    ev = EVIDENCE if cfg['weights'] == 'evidence' else dict.fromkeys(CHANNELS, 1.0)
+    ev = EVIDENCE if cfg['weights'] == 'evidence' else dict.fromkeys(CHANNELS + PULSE, 1.0)
     return detect.channel_weights(detect.weekly(learn.personal_baseline(d, prior, personal=cfg['personal'])), ev)
 
 
@@ -80,8 +84,11 @@ def pipeline(daily, people, split, cfg, fitted=None, perturb=None):
     """Fit on clean fit/cal people, then score the test people -> (dec_test, wk_test, models, thresholds).
 
     split = {'fit','cal','test'} pid lists; cfg = BASE-like dict. fitted=(models, thresholds) skips fitting;
-    perturb=(kind, level, kwargs) degrades the TEST daily only (models stay fitted on clean data)."""
+    perturb=(kind, level, kwargs) degrades the TEST daily only (models stay fitted on clean data).
+    cfg['pulse'] False (the default) drops the optional PULSE columns everywhere; True = the with_pulse variant."""
     inn = lambda df, k: df[df.pid.isin(split[k])]
+    if not cfg['pulse']:
+        daily = daily.drop(columns=PULSE, errors='ignore')
     if fitted is None:
         d = learn.quality_gate(daily[daily.pid.isin(split['fit'] + split['cal'])])
         ctx = learn.fit_context(inn(d, 'fit')) if cfg['context'] else None
@@ -151,12 +158,26 @@ def operating_curve(fits, people, split, budgets=BUDGETS):
         out[name] = {}
         for b in budgets:
             m = metrics(warn.decide(dec, warn.tune_warning(models['pred_cal'], cal, budget=b)), tp)
-            out[name][b] = {k: m[k] for k in ('sens_lead_90', 'alarms_per_nonconv_py', 'warning_precision')}
+            out[name][b] = {k: m[k] for k in ('sens_lead_0', 'sens_lead_30', 'sens_lead_90', 'alarms_per_nonconv_py',
+                                              'warning_precision')}
+    out['chance'] = {b: {**chance_floor(fits['full'][0], tp, b), 'alarms_per_nonconv_py': b,
+                         'warning_precision': float('nan')} for b in budgets}
+    return out
+
+
+def chance_floor(dec, tp, b):
+    """No-skill floor: random warnings at rate b per person-year from baseline-ready on. sens_lead_L = P(>= 1 warning
+    in [start, t_ref - L]); sens_post_onset_L scores like evaluate's sens_post_onset (a first warning before the
+    simulated drift onset = miss): P(none in [start, onset)) * P(>= 1 in [max(onset, start), t_ref - L])."""
     conv = tp[tp.converter.astype(bool)]
-    start = conv.pid.map(7 * fits['full'][0].groupby('pid').week.min())
-    floor = lambda b, lead: float(np.mean(1 - np.exp(-b * ((conv.t_ref - lead - start).clip(lower=0).fillna(0) / 365.25))))
-    out['chance'] = {b: {'sens_lead_0': floor(b, 0), 'sens_lead_30': floor(b, 30), 'sens_lead_90': floor(b, 90),
-                         'alarms_per_nonconv_py': b, 'warning_precision': float('nan')} for b in budgets}
+    yr = lambda s: s.clip(lower=0).fillna(0).to_numpy() / 365.25
+    start = conv.pid.map(7 * dec.groupby('pid').week.min())
+    out = {f'sens_lead_{L}': float(np.mean(1 - np.exp(-b * yr(conv.t_ref - L - start)))) for L in (0, 30, 90)}
+    if 'onset' in conv and conv.onset.notna().any():
+        on = conv.onset.fillna(-np.inf)                                  # converter without latent onset: never pre-onset
+        for L in (30, 90):
+            pre, post = yr(np.minimum(on, conv.t_ref - L) - start), yr(conv.t_ref - L - np.maximum(on, start))
+            out[f'sens_post_onset_{L}'] = float(np.mean(np.exp(-b * pre) * (1 - np.exp(-b * post))))
     return out
 
 
@@ -241,10 +262,29 @@ def figures(out, dec, decs, tp, curve):
     plt.close('all')
 
 
+DEFS = ('sens_spec92 = per-WEEK sensitivity at 92% per-WEEK specificity: landmark weeks, p threshold from the y=0 weeks of '
+        "the CALIBRATION people (spec_spec92_test = per-week specificity reached on test); not the system's operating "
+        'point. specificity = non-converters never prompted during follow-up (median {fu:.1f} months of monitoring after '
+        'the warm-up): CUMULATIVE over follow-up, not a single-window specificity; f1 and ppv_person (person-level PPV of '
+        'a prompt) at this test conversion rate of {prev:.0%}; lr_pos = Se0 / share of non-converters prompted. '
+        'false_prompt_6mo / 12mo = Kaplan-Meier probability that a non-converter has >= 1 false prompt by 6 / 12 months '
+        'of monitoring (day 0 = first landmark week, censored at end of follow-up). alarms_per_nonconv_py: per calendar '
+        'person-year (warm-up included); alarms_per_nonconv_monitored_py: per monitored (post-warm-up) person-year. '
+        'prompts_per_nonconv_py_r26 = prompts (confirmatory home-BP weeks) per non-converter calendar person-year after '
+        'a 26-week refractory period (chosen to equal the 26-week prediction horizon; not the clinical panel rule of 13 weeks after a normal cuff series). It is a '
+        'burden metric only: first warnings, every other metric, the tuned thresholds and the chance floor use the '
+        'unsuppressed episodes. sens_post_onset_30/90 = Se30/Se90 counting a first warning before the simulated drift '
+        'onset as a miss (n_pre_onset_first_warnings = how many); sens_lead_* count every warning before t_ref.')
+
+
 def write_report(path, res, args_str):
-    groups = [('A', ['auroc', 'auprc']), ('B', ['sens_lead_0', 'sens_lead_30', 'sens_lead_90', 'sens_lead_180', 'median_lead']),
-              ('C', ['alarms_per_nonconv_py', 'warning_precision']), ('D', ['brier', 'ece']),
-              ('F', ['aurc', 'abstention_rate'])]
+    groups = [('A', ['auroc', 'auprc', 'sens_spec92', 'spec_spec92_test', 'thr_spec92']),
+              ('B', ['sens_lead_0', 'sens_lead_30', 'sens_lead_90', 'sens_lead_180', 'median_lead',
+                     'sens_post_onset_30', 'sens_post_onset_90', 'n_pre_onset_first_warnings']),
+              ('C', ['alarms_per_nonconv_py', 'alarms_per_nonconv_monitored_py', 'prompts_per_nonconv_py_r26',
+                     'warning_precision', 'specificity', 'f1', 'ppv_person', 'lr_pos', 'false_prompt_6mo',
+                     'false_prompt_12mo', 'followup_median_days', 'false_prompts_per_nonconv']),
+              ('D', ['brier', 'ece']), ('F', ['aurc', 'abstention_rate'])]
     main = res['main']
     L = ['# SENTINEL-HTN results', '', f'Run: {args_str}. Test people: {main["n_people"]} ({main["n_converters"]} converters). '
          f'Thresholds: persistence dev > {res["thresholds"]["thr"]:.3f}, warning p_lo >= {res["thresholds"]["thr_p"]:.3f}. '
@@ -257,6 +297,9 @@ def write_report(path, res, args_str):
           table({'clean': main, **res['robustness']}, KEY, ref='clean'), '',
           '## Fairness (E8): by skin_ita tercile', '',
           table({k: v for k, v in res['fairness'].items()}, ['n_people', 'n_converters', *KEY]), '',
+          '## By age tercile (years): model behaviour by age; age has no causal role in the simulator', '',
+          table({k: v for k, v in res['by_age'].items()}, ['n_people', 'n_converters', *KEY]), '', DEFS.format(
+              fu=main['followup_median_days'] / 30.44, prev=main['n_converters'] / main['n_people']), '',
           '## Early-warning operating curve: sensitivity at >= 90 d lead (alarms/non-converter-yr) per warning budget', '',
           '| budget | ' + ' | '.join(res['operating_curve']) + ' |', '|---' * (len(res['operating_curve']) + 1) + '|']
     L += [f'| {b} | ' + ' | '.join(f"{_f(c[b]['sens_lead_90'])} ({_f(c[b]['alarms_per_nonconv_py'])})"
@@ -266,6 +309,162 @@ def write_report(path, res, args_str):
     L += ['', 'Figures: `calibration.png`, `lead_time.png`, `risk_coverage.png`, `lead_vs_budget.png`.', '']
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(L))
+
+
+def _ms(xs):
+    return 'n/a' if any(x is None for x in xs) else f'{np.mean(xs):.3f} ± {np.std(xs, ddof=1):.3f}'
+
+
+def _leaves(o, path=()):
+    """(path, value) for every leaf of a nested dict."""
+    if isinstance(o, dict):
+        for k, v in o.items():
+            yield from _leaves(v, path + (k,))
+    else:
+        yield path, o
+
+
+def _at_rate(curve, k, rate):
+    """Sensitivity k along an operating curve ({budget: metrics}) at a realised test alarm rate: linear interpolation
+    (0 alarms = 0 sensitivity; clamped beyond the curve's largest realised rate)."""
+    x, y = zip(*sorted([(0.0, 0.0)] + [(v['alarms_per_nonconv_py'], v[k]) for v in curve.values()]))
+    return float(np.interp(rate, x, y))
+
+
+def _matched(r, b, k):
+    """(main, with_pulse) sensitivity k at main's realised test alarm rate for warning budget b (metrics.json)."""
+    oc = r['operating_curve']
+    return oc['full'][b][k], _at_rate(oc['with_pulse'], k, oc['full'][b]['alarms_per_nonconv_py'])
+
+
+def _row(label, pairs):
+    """'| label | main | with_pulse | per-seed diff | mean ± SD | seeds with_pulse > main |' from per-seed (main, wp)."""
+    m, w = zip(*pairs)
+    if None in m + w:
+        return f'| {label} | n/a | n/a | | | |'
+    diff = [b - a for a, b in pairs]
+    return (f'| {label} | {_ms(m)} | {_ms(w)} | ' + ' '.join(f'{x:+.3f}' for x in diff)
+            + f' | {_ms(diff)} | {sum(x > 0 for x in diff)}/{len(diff)} |')
+
+
+ARM_HEAD = ['| metric | main (no pulse) | with_pulse | with_pulse - main per seed | mean ± SD | seeds with_pulse > main |',
+            '|---|---|---|---|---|---|']
+BURDEN = ['false_prompt_6mo', 'false_prompt_12mo', 'followup_median_days', 'specificity', 'false_prompts_per_nonconv',
+          'ppv_person', 'lr_pos', 'alarms_per_nonconv_py', 'alarms_per_nonconv_monitored_py', 'prompts_per_nonconv_py_r26']
+ONSET = ['sens_lead_30', 'sens_post_onset_30', 'sens_lead_90', 'sens_post_onset_90', 'n_pre_onset_first_warnings']
+
+
+def summarise(root, ref=None):
+    """root/summary.md: mean ± SD (ddof=1) over root/seed*/metrics.json; main = pulse OFF, with_pulse = the variant.
+    ref = directory of earlier runs with the same seed folders: every value they share with this run must be equal
+    (with pulse off by default, main == results/weighted)."""
+    files = sorted(glob.glob(os.path.join(root, 'seed*', 'metrics.json')))
+    runs = {os.path.basename(os.path.dirname(f)): json.load(open(f)) for f in files}
+    R = list(runs.values())
+    arms = lambda k: [(r['main'][k], r['ablations']['with_pulse'][k]) for r in R]
+
+    def tab(rows, cols):
+        out = ['| run | ' + ' | '.join(cols) + ' |', '|---' * (len(cols) + 1) + '|']
+        return out + [f'| {name} | ' + ' | '.join(_ms([g(r)[c] for r in R]) for c in cols) + ' |' for name, g in rows]
+    # decision rule (written after the own-operating-point results were known; the effect sizes carry the verdict): a gain needs with_pulse > main in every seed for AUROC and matched Se30 and Se90 at budget 0.5
+    gain = all(w > m for k in ('sens_lead_30', 'sens_lead_90') for m, w in (_matched(r, '0.5', k) for r in R)) \
+        and all(w > m for m, w in arms('auroc'))
+    L = [f'# SENTINEL-HTN: main model (pulse OFF) and the with_pulse variant: {len(R)} seeds '
+         f'({", ".join(runs)}), mean ± SD over seeds', '',
+         'Synthetic cohort (calibrated simulator). with_pulse adds the optional pulse_htn channel (the embedding-drift '
+         'channel pulse_drift was removed after the audit: non-directional, near-zero simulated signal). Its '
+         f'within-person BP coupling ({R[0].get("pulse_coupling")} night SD per mmHg here, the cross-sectional slope, an '
+         'UPPER bound) and night-to-night noise are ASSUMPTIONS (CONTRACT.md). The zero-coupling arm is in '
+         'coupling_sweep.md and must be read with every with_pulse number.', '',
+         f'**Result: {"a consistent gain" if gain else "no improvement"} from the pulse channel** (decision rule, set after the own-operating-point results were known: '
+         "with_pulse above main in every seed for AUROC and for Se30 and Se90 at main's realised alarm rate, budget 0.5). "
+         'Separately tuned thresholds put the two arms at different alarm rates, so a lower alarm rate or a higher '
+         'cumulative specificity for with_pulse at its own operating point is an operating-point shift, not better '
+         'separation; compare the arms at matched alarm rates below.', '',
+         '## with_pulse vs main at matched alarm rates (operating curve)', '',
+         "For each warning budget (thresholds tuned on calibration people), main's realised test alarm rate is the "
+         "reference; with_pulse's sensitivity is read off its own operating curve at that rate (linear interpolation, "
+         '0 alarms = 0). Se0 = warned before t_ref; Se30 / Se90 = warned >= 30 / 90 days before t_ref.', '',
+         "| budget | realised alarms/py: main; with_pulse | metric | main | with_pulse at main's rate | with_pulse - main "
+         'per seed | mean ± SD | seeds with_pulse > main |', '|---|---|---|---|---|---|---|---|']
+    for b in R[0]['operating_curve']['full']:
+        al = '; '.join(_ms([r['operating_curve'][a][b]['alarms_per_nonconv_py'] for r in R]) for a in ('full', 'with_pulse'))
+        L += [f'| {b} | {al} ' + _row(k, [_matched(r, b, k) for r in R]) for k in ('sens_lead_0', 'sens_lead_30', 'sens_lead_90')]
+    L += ['', '## Main model and ablations (with_pulse = main + pulse_htn), each at its own operating point', '']
+    L += tab([('main (no pulse)', lambda r: r['main'])] + [(k, lambda r, k=k: r['ablations'][k]) for k in R[0]['ablations']], KEY)
+    L += ['', '## with_pulse minus main at their own operating points (NOT alarm-matched), per seed', '', *ARM_HEAD]
+    L += [_row(k, arms(k)) for k in KEY]
+    L += ['', '## False prompts over time (non-converters, test people)', '',
+          'Day 0 = first landmark week (after the personal-baseline warm-up). false_prompt_6mo / 12mo = Kaplan-Meier '
+          'probability of >= 1 false prompt by 6 / 12 months of monitoring, censored at end of follow-up. specificity = '
+          'non-converters never prompted, CUMULATIVE over the median follow-up (followup_median_days), not a '
+          'single-window specificity. ppv_person = person-level PPV of a prompt at the test conversion rate '
+          f'({_ms([r["main"]["n_converters"] / r["main"]["n_people"] for r in R])}); lr_pos = Se0 / share of '
+          'non-converters prompted. alarms_per_nonconv_py divides by calendar time (warm-up included), '
+          'alarms_per_nonconv_monitored_py by monitored, post-warm-up time.', '',
+          'prompts_per_nonconv_py_r26 = prompts (confirmatory home-BP weeks) per non-converter calendar person-year with '
+          "repeat suppression: a 26-week refractory period after each prompt (not the clinical panel's rule, which was 13 weeks after a normal cuff series), because "
+          '26 weeks is the prediction horizon. It is a BURDEN metric only: first warnings are unchanged (asserted in '
+          "evaluate.metrics), and every other metric, the tuned thresholds and the operating curve's chance floor use "
+          'the unsuppressed episodes.', '', *ARM_HEAD]
+    L += [_row(k, arms(k)) for k in BURDEN]
+    L += ['', '## Pre-onset warnings (simulator: drift onset known)', '',
+          'sens_post_onset_30/90 = Se30/Se90 counting a converter whose first warning came BEFORE the simulated drift onset '
+          'as a miss (an added sensitivity analysis; sens_lead_* are unchanged and count every warning before t_ref). '
+          'n_pre_onset_first_warnings = converters whose first warning preceded onset.', '', *ARM_HEAD]
+    L += [_row(k, arms(k)) for k in ONSET]
+    L += ['', '## Robustness (test people perturbed; with_pulse_drop_pulse = with_pulse model, pulse removed at test time)', '']
+    L += tab([('clean', lambda r: r['main'])] + [(k, lambda r, k=k: r['robustness'][k]) for k in R[0]['robustness']], KEY)
+    for key, title, note in (('fairness', 'skin_ita', ''),
+                             ('by_age', 'age', ': model behaviour by age; age has no causal role in the simulator')):
+        L += ['', f'## By {title} tercile, main model (T1 = lowest; edges differ per seed){note}', '']
+        L += tab([(f'T{i + 1}', lambda r, i=i: list(r[key].values())[i]) for i in range(3)], ['n_people', 'n_converters', *KEY])
+    for key in ('weights', 'weights_with_pulse'):
+        L += ['', f'## Normalised channel weights ({key}), per seed', '']
+        L += ['- ' + ', '.join(f'{c} {w / sum(r[key].values()):.2f}' for c, w in r[key].items()) for r in R]
+    led = R[0].get('ledger_with_pulse')
+    if led:
+        L += ['', f'Example with_pulse ledger ({list(runs)[0]}, {led["pid"]} week {led["week"]}): channel_contrib (mean '
+              'weekly z, last 6 weeks) ' + ', '.join(f'{c} {_f(v)}' for c, v in led['channel_contrib'].items())]
+    if ref:
+        L += ['', f'## Default-off invariant: every value shared with {ref}/<seed>/metrics.json', '']
+        for s, r in runs.items():
+            mine = dict(_leaves(r))
+            shared = [(p, v) for p, v in _leaves(json.load(open(os.path.join(ref, s, 'metrics.json')))) if p in mine]
+            diff = ['/'.join(map(str, p)) for p, v in shared if mine[p] != v]
+            main_ok = all(mine[p] == v for p, v in shared if p[0] == 'main')
+            L.append(f'- {s}: main {"identical" if main_ok else "DIFFERS"}; {len(shared)} shared values, '
+                     + ('all identical' if not diff else f'{len(diff)} differ: {diff[:5]}'))
+    open(os.path.join(root, 'summary.md'), 'w', encoding='utf-8').write('\n'.join(L) + '\n')
+    print('\n'.join(L))
+
+
+def coupling_sweep(dirs, out):
+    """out/coupling_sweep.md: with_pulse vs main (pulse off) for each assumed pulse coupling; dirs = run roots holding
+    seed*/metrics.json, each run with its own --pulse-coupling."""
+    L = ['# Pulse coupling sweep (assumed within-person coupling; mean ± SD over seeds)', '',
+         'coupling = within-person shift of pulse_htn, night-to-night SD per mmHg of latent SBP. 0 = the pulse channel '
+         'carries no BP signal (a pure-noise channel: with_pulse must gain nothing and raise no extra alarms); the middle '
+         'value equals the age-adjusted BETWEEN-person slope from PPG-BP (results/ppg_bp, an upper bound for within-person '
+         'coupling per the audit); 2x is a stress test beyond it. main = pulse OFF (identical at every coupling). Rows '
+         "\"at main's rate\" compare the arms at matched alarm rates (with_pulse read off its operating curve at main's "
+         'realised test alarm rate); the other rows put each arm at its own operating point (budget 0.5).', '',
+         '| coupling | metric | main (no pulse) | with_pulse | with_pulse - main per seed | mean ± SD | seeds with_pulse > main |',
+         '|---|---|---|---|---|---|---|']
+    for d in dirs:
+        R = [json.load(open(f)) for f in sorted(glob.glob(os.path.join(d, 'seed*', 'metrics.json')))]
+        c = f"| {R[0]['pulse_coupling']:g} "
+        arms = lambda k: [(r['main'][k], r['ablations']['with_pulse'][k]) for r in R]
+        L += [c + _row(k, arms(k)) for k in ('auroc', 'auprc', 'sens_lead_0', 'sens_lead_30', 'sens_lead_90')]
+        L += [c + _row(f"{k} at main's rate, budget 0.5", [_matched(r, '0.5', k) for r in R])
+              for k in ('sens_lead_0', 'sens_lead_30', 'sens_lead_90')]
+        L += [c + _row(f"{k} at main's rate, mean over budgets",
+                       [tuple(np.mean([_matched(r, b, k) for b in r['operating_curve']['full']], 0)) for r in R])
+              for k in ('sens_lead_30', 'sens_lead_90')]
+        L += [c + _row(k, arms(k)) for k in ('alarms_per_nonconv_py', 'prompts_per_nonconv_py_r26', 'false_prompt_12mo',
+                                             'specificity', 'sens_spec92')]
+    open(os.path.join(out, 'coupling_sweep.md'), 'w', encoding='utf-8').write('\n'.join(L) + '\n')
+    print('\n'.join(L))
 
 
 def main():
@@ -279,14 +478,26 @@ def main():
     ap.add_argument('--quick', action='store_true', help='n=150, days=360, n_boot=5')
     ap.add_argument('--out', default='results')
     ap.add_argument('--lifesnaps', help='LifeSnaps daily_fitbit_sema_df_unprocessed.csv: real-world transfer test')
+    ap.add_argument('--summary', help='directory with seed*/metrics.json: write its summary.md and exit')
+    ap.add_argument('--ref', help='with --summary: earlier runs whose shared values must be identical')
+    ap.add_argument('--sweep', nargs='+', help='run roots (one per pulse coupling): write --out/coupling_sweep.md and exit')
+    ap.add_argument('--pulse-coupling', type=float, default=data.PULSE_COUPLING,
+                    help='synthetic: assumed within-person pulse coupling, night SD per mmHg (0 = no BP signal)')
     a = ap.parse_args()
+    if a.summary:
+        return summarise(a.summary, a.ref)
+    if a.sweep:
+        return coupling_sweep(a.sweep, a.out)
     if not a.synthetic and not (a.daily and a.people) and not a.lifesnaps:
-        ap.error('give --synthetic, both --daily and --people, or --lifesnaps')
+        ap.error('give --synthetic, both --daily and --people, --lifesnaps, --summary or --sweep')
     n, days, n_boot = (150, 360, 5) if a.quick else (a.n, a.days, BASE['n_boot'])
-    daily, people = data.load_csv(a.daily, a.people) if a.daily else data.make_cohort(n, days, a.seed)
+    daily, people = (data.load_csv(a.daily, a.people) if a.daily else
+                     data.make_cohort(n, days, a.seed, pulse_coupling=a.pulse_coupling))
     split = make_split(people, a.seed)
     tp = people[people.pid.isin(split['test'])]
     cfg = {**BASE, 'n_boot': n_boot, 'seed': a.seed}
+    if a.lifesnaps:   # the target has no pulse channels: train the transfer model on the channels it has
+        daily = daily.drop(columns=PULSE, errors='ignore')
     os.makedirs(a.out, exist_ok=True)
 
     dec, wk, models, th = pipeline(daily, people, split, cfg)
@@ -307,17 +518,24 @@ def main():
         open(os.path.join(a.out, 'real_world.md'), 'w', encoding='utf-8').write('\n'.join(md) + '\n')
         print('\n'.join(md))
         return
-    res = {'main': metrics(dec, tp), 'thresholds': th, 'weights': models['weights'], 'trend_r': models['trend_r'],
-           'ablations': {}, 'robustness': {}}
+    res = {'main': metrics(dec, tp, cal=models['pred_cal']), 'thresholds': th, 'weights': models['weights'], 'trend_r': models['trend_r'],
+           'ablations': {}, 'robustness': {}, 'pulse_coupling': None if a.daily else a.pulse_coupling}
     abl = {name: pipeline(daily, people, split, {**cfg, **over}) for name, over in ABLATIONS.items()}
     decs = {'full': dec, **{k: v[0] for k, v in abl.items()}}
-    res['ablations'] = {k: metrics(v[0], tp) for k, v in abl.items()}
-    fits = {'full': (dec, models), **{k: (abl[k][0], abl[k][2]) for k in ('level_only', 'cuff_only')}}
+    res['ablations'] = {k: metrics(v[0], tp, cal=v[2]['pred_cal']) for k, v in abl.items()}
+    fits = {'full': (dec, models), **{k: (abl[k][0], abl[k][2]) for k in ('level_only', 'cuff_only', 'with_pulse')}}
     res['operating_curve'] = operating_curve(fits, people, split)
+    res['chance'] = chance_floor(dec, tp, res['main']['alarms_per_nonconv_py'])   # at the model's realised alarm rate
     for name, pt in ROBUSTNESS.items():
-        res['robustness'][name] = metrics(pipeline(daily, people, split, cfg, (models, th), pt)[0], tp)
-    res['fairness'] = by_group(dec, tp, 'skin_ita', 3).to_dict('index')
+        res['robustness'][name] = metrics(pipeline(daily, people, split, cfg, (models, th), pt)[0], tp, cal=models['pred_cal'])
+    wp = abl['with_pulse']                         # RQ5: the with_pulse model when the pulse channels vanish at test time
+    res['robustness']['with_pulse_drop_pulse'] = metrics(pipeline(daily, people, split, {**cfg, 'pulse': True}, wp[2:],
+                                                                  ('drop_channel', 1.0, {'channel': PULSE}))[0], tp, cal=wp[2]['pred_cal'])
+    res['weights_with_pulse'] = wp[2]['weights']
+    res['fairness'] = by_group(dec, tp, 'skin_ita', 3, models['pred_cal']).to_dict('index')
+    res['by_age'] = by_group(dec, tp, 'age', 3, models['pred_cal']).to_dict('index')
     res['ledger'] = example_ledger(dec, wk, tp)
+    res['ledger_with_pulse'] = example_ledger(wp[0], wp[1], tp)
 
     with open(os.path.join(a.out, 'metrics.json'), 'w') as f:
         json.dump(_clean(res), f, indent=2)
