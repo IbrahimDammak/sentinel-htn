@@ -23,9 +23,10 @@ plt.rcParams.update({'font.size': 7.5, 'font.family': 'serif', 'axes.linewidth':
 
 
 def architecture():
-    """Fig. 1 — Learn -> Detect -> Predict -> Warn pipeline with optional frozen foundation-model encoders (full width)."""
-    fig, ax = plt.subplots(figsize=(7.16, 2.45))
-    ax.set(xlim=(0, 100), ylim=(0, 32)); ax.axis('off')
+    """Fig. 1 — Learn -> Detect -> Predict -> Warn pipeline with optional frozen foundation-model encoders and the optional
+    agent audit layer (full width)."""
+    fig, ax = plt.subplots(figsize=(7.16, 2.65))
+    ax.set(xlim=(0, 100), ylim=(-3, 32)); ax.axis('off')
     Y = 11.5  # main row sits above the encoder row
     boxes = [  # x, title, subtitle, lines, face
         (0.5, 'Inputs', '', 'wrist PPG + IMU\nsleep, steps,\ncontext, sparse\nhome cuff', '#eeeeee'),
@@ -57,8 +58,18 @@ def architecture():
         ax.text(x + 13.75, 3.4, body, ha='center', va='center', fontsize=5.2, linespacing=1.2)
     ax.annotate('', (33.5, 3.0 + Y), (28.4, 6.5), arrowprops=dict(arrowstyle='->', lw=0.6, ls='--'))
     ax.annotate('', (37.25, 3.0 + Y), (37.25, 9.4), arrowprops=dict(arrowstyle='->', lw=0.6, ls='--'))
-    ax.text(61.0, 4.8, 'optional, frozen, never trained here;\nreal-label probes in Results', ha='left', va='center',
-            fontsize=5.4, style='italic', color='#444')
+    ax.text(0.5, -1.6, 'encoders: optional, frozen, never trained here; real-label probes in Results', ha='left',
+            va='center', fontsize=5.4, style='italic', color='#444')
+    # optional agent audit layer (dashed): audits each prompt; can only downgrade a whole WARNING episode
+    ax.add_patch(FancyBboxPatch((60.5, 0.6), 28.5, 8.4, boxstyle='round,pad=0.3,rounding_size=0.8', fc='#fdf1e3',
+                                ec='#a85a0c', lw=0.6, ls='--'))
+    ax.text(74.75, 7.0, 'Agent audit layer (optional)', ha='center', va='center', weight='bold', fontsize=6.0)
+    ax.text(74.75, 3.2, 'Profiler -> Predictor -> Auditor\non each prompt; a veto removes\nthe whole warning episode',
+            ha='center', va='center', fontsize=5.2, linespacing=1.2)
+    ax.annotate('', (82.25, 9.4), (82.25, 3.0 + Y), arrowprops=dict(arrowstyle='->', lw=0.6, ls='--', color='#a85a0c'))
+    ax.text(83.0, 12.2, 'prompts', ha='left', va='center', fontsize=5.0, color='#a85a0c')
+    ax.annotate('', (91.2, 4.8), (89.4, 4.8), arrowprops=dict(arrowstyle='->', lw=0.6, color='#a85a0c'))
+    ax.text(95.6, 4.8, 'veto ->\nINSUFFICIENT', ha='center', va='center', fontsize=5.0, linespacing=1.2)
     fig.savefig(os.path.join(OUT, 'fig_architecture.pdf'), bbox_inches='tight')
     fig.savefig(os.path.join(OUT, 'fig_architecture.png'), bbox_inches='tight', dpi=200)   # README
 

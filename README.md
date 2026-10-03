@@ -45,6 +45,11 @@ flowchart LR
     W --> WA["WARNING<br/>7-day cuff series"]
     W --> IS["INSUFFICIENT<br/>keep monitoring"]
     W --> PQ["POOR_QUALITY<br/>abstain"]
+    subgraph AG["Optional agent audit layer (--agents) - off by default"]
+        AP["Profiler → Predictor → Auditor<br/>on each prompt"]
+    end
+    W -. prompts .-> AP
+    AP -. "veto: whole episode<br/>WARNING → INSUFFICIENT" .-> IS
 ```
 
 | Stage | File | Research question | What it does |
