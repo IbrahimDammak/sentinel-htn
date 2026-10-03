@@ -132,10 +132,6 @@ L2 = 10.0     # penalty on person-weighted loss (each person weighs 1); fixed, n
 FOLDS = 5     # person-grouped folds for out-of-fold calibration scores
 
 
-def _person_weights(lm):
-    return 1.0 / lm.groupby('pid').pid.transform('size').to_numpy(float)
-
-
 def _score(w, X):
     return expit(w[0] + X @ w[1:])
 
@@ -158,8 +154,8 @@ def fit(lm_fit, lm_cal, cols, l2=None, n_boot=20, seed=0):
     model['mu'], sd = Z.mean(axis=0), Z.std(axis=0)
     model['sd'] = np.where(sd > 0, sd, 1.0)
     X, y = (Z - model['mu']) / model['sd'], lm_fit.y.to_numpy(float)
-    sw = _person_weights(lm_fit)
-    model['l2'] = l2 = L2 if l2 is None else l2
+    sw = 1.0 / lm_fit.groupby('pid').pid.transform('size').to_numpy(float)
+    l2 = L2 if l2 is None else l2
     w = _logit_fit(X, y, l2, np.zeros(X.shape[1] + 1), sw)
     # ponytail: bootstrap refits reuse the full-fit standardisation/imputation; re-estimate per draw if it matters
     codes = pd.factorize(lm_fit.pid)[0]
@@ -198,13 +194,8 @@ def predict(model, lm):
     return out
 
 
-def _auroc(y, s):
-    r = pd.Series(s).rank().to_numpy()
-    n1 = y.sum()
-    return (r[y == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * (len(y) - n1))
-
-
 if __name__ == '__main__':
+    from .evaluate import auroc
     rng = np.random.default_rng(1)
     assert all('onset' not in c for c in FEATURE_SETS.values())
     assert set(FEATURE_SETS) == {'full', 'level_only', 'cuff_only', 'change_only'}
@@ -218,7 +209,7 @@ if __name__ == '__main__':
     tr, ca, te = synth(150), synth(60), synth(60)
     m = fit(tr, ca, ['x1', 'x2'], n_boot=10)
     out = predict(m, te)
-    auc = _auroc(te.y.to_numpy(), out.p.to_numpy())
+    auc = auroc(te.y.to_numpy(), out.p.to_numpy())
     assert auc > 0.8, auc
     assert (out.p_lo <= out.p).all() and (out.p <= out.p_hi).all() and out.p.between(0, 1).all()
     assert (out.p_hi - out.p_lo).mean() > 0  # bootstrap band is not degenerate

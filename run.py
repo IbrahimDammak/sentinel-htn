@@ -296,9 +296,9 @@ def write_report(path, res, args_str):
           '## Robustness (E): test people perturbed, models fitted on clean data', '',
           table({'clean': main, **res['robustness']}, KEY, ref='clean'), '',
           '## Fairness (E8): by skin_ita tercile', '',
-          table({k: v for k, v in res['fairness'].items()}, ['n_people', 'n_converters', *KEY]), '',
+          table(res['fairness'], ['n_people', 'n_converters', *KEY]), '',
           '## By age tercile (years): model behaviour by age; age has no causal role in the simulator', '',
-          table({k: v for k, v in res['by_age'].items()}, ['n_people', 'n_converters', *KEY]), '', DEFS.format(
+          table(res['by_age'], ['n_people', 'n_converters', *KEY]), '', DEFS.format(
               fu=main['followup_median_days'] / 30.44, prev=main['n_converters'] / main['n_people']), '',
           '## Early-warning operating curve: sensitivity at >= 90 d lead (alarms/non-converter-yr) per warning budget', '',
           '| budget | ' + ' | '.join(res['operating_curve']) + ' |', '|---' * (len(res['operating_curve']) + 1) + '|']

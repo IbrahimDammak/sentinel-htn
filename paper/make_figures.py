@@ -1,4 +1,4 @@
-"""Regenerate the paper figures from the pipeline (3 seeds, n=1200 x 540 d) and results/seed*/metrics.json.
+"""Regenerate the paper figures from the pipeline (3 seeds, n=1200 x 540 d) and results/weighted/seed*/metrics.json.
 Run from the repo root: python paper/make_figures.py   (~1 min)
 """
 import json
@@ -60,6 +60,7 @@ def architecture():
     ax.text(61.0, 4.8, 'optional, frozen, never trained here;\nreal-label probes in Results', ha='left', va='center',
             fontsize=5.4, style='italic', color='#444')
     fig.savefig(os.path.join(OUT, 'fig_architecture.pdf'), bbox_inches='tight')
+    fig.savefig(os.path.join(OUT, 'fig_architecture.png'), bbox_inches='tight', dpi=200)   # README
 
 
 def outcomes():
