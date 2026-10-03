@@ -1,0 +1,34 @@
+{
+ "threshold": 0.15,
+ "block_days": 14,
+ "ramp_days": 28,
+ "drift_mmHg": [
+  12,
+  22
+ ],
+ "reps": 20,
+ "real (plasmode)": {
+  "people": 18,
+  "false": 0.05555555555555556,
+  "detected": 0.31388888888888883,
+  "median_lag_days": 26.175,
+  "post_onset_weeks": 9.357142857142858,
+  "detected_sd_over_reps": 0.02718669360719959
+ },
+ "simulated, AR(1) noise": {
+  "people": 276,
+  "false": 0.24275362318840585,
+  "detected": 0.7702898550724636,
+  "median_lag_days": 39.35,
+  "post_onset_weeks": 11.142857142857142,
+  "detected_sd_over_reps": 0.008983292460983854
+ },
+ "simulated, transplanted noise": {
+  "people": 276,
+  "false": 0.30797101449275366,
+  "detected": 0.7331521739130434,
+  "median_lag_days": 41.7,
+  "post_onset_weeks": 11.142857142857142,
+  "detected_sd_over_reps": 0.01006252630859696
+ }
+}
