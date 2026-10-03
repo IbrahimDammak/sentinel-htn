@@ -2,18 +2,18 @@
 import numpy as np
 import pandas as pd
 
-from . import CHANNELS, RISK_SIGN
+from . import CHANNELS, PULSE, RISK_SIGN, channels
 
-MASKED = ['night_rhr', 'night_rmssd', 'still_hr']   # channels blanked on acute-context days
+MASKED = ['night_rhr', 'night_rmssd', 'still_hr', *PULSE]   # channels blanked on acute-context days
 
 
 def quality_gate(daily, sqi_min=0.6, exercise_max=45):
     """Add `valid` and `ctx_masked`; blank channels on invalid days, night/still channels on acute days."""
-    d = daily.copy()
-    d['valid'] = (d['sqi'] >= sqi_min) & (d['rhythm_irregular'] == 0) & d[CHANNELS].notna().any(axis=1)
-    d.loc[~d['valid'], CHANNELS] = np.nan
+    d, chs = daily.copy(), channels(daily)
+    d['valid'] = (d['sqi'] >= sqi_min) & (d['rhythm_irregular'] == 0) & d[chs].notna().any(axis=1)
+    d.loc[~d['valid'], chs] = np.nan
     acute = (d['exercise_min'] > exercise_max) | (d['alcohol'] == 1) | (d['illness'] == 1)
-    d.loc[acute, MASKED] = np.nan
+    d.loc[acute, [c for c in MASKED if c in chs]] = np.nan
     d['ctx_masked'] = acute.astype(int)
     return d
 
@@ -30,7 +30,7 @@ def fit_context(daily):
     X = _design(daily)
     okx = np.isfinite(X).all(axis=1)
     ctx = {}
-    for ch in CHANNELS:
+    for ch in channels(daily):
         y = daily[ch].to_numpy(float)
         ok = okx & np.isfinite(y)
         ctx[ch] = np.linalg.lstsq(X[ok], y[ok], rcond=None)[0] if ok.sum() >= X.shape[1] else np.zeros(X.shape[1])
@@ -41,7 +41,7 @@ def apply_context(daily, ctx):
     """Add `<ch>_adj` = value minus the context effect (intercept excluded; missing context = no effect)."""
     d = daily.copy()
     X = np.nan_to_num(_design(d)[:, 1:])
-    for ch in CHANNELS:
+    for ch in [c for c in channels(d) if c in ctx]:
         d[ch + '_adj'] = d[ch] - X @ ctx[ch][1:]
     return d
 
@@ -50,7 +50,7 @@ def fit_prior(daily, warmup_days=56):
     """Population prior per channel from each person's first `warmup_days` of `<ch>_adj`."""
     w = daily[daily['day'] < warmup_days]
     prior = {}
-    for ch in CHANNELS:
+    for ch in channels(w, '_adj'):
         g = w.groupby('pid')[ch + '_adj']
         n, mu, s2 = g.count(), g.mean(), g.var()
         df = (n - 1).clip(lower=0)
@@ -75,8 +75,8 @@ def personal_baseline(daily, prior, warmup_valid=28, personal=True):
     val = d['valid'].astype(int)
     ready = (val.groupby(key).cumsum() - val) >= warmup_valid    # valid days strictly before this row
     out = d[['pid', 'day']].copy()
-    for ch, sign in RISK_SIGN.items():
-        p, x = prior[ch], d[ch + '_adj']
+    for ch in [c for c in channels(d, '_adj') if c in prior]:
+        p, x, sign = prior[ch], d[ch + '_adj'], RISK_SIGN[ch]
         if personal:
             xw = x.where(~ready)
             n = xw.notna().astype(int).groupby(key).transform('sum')

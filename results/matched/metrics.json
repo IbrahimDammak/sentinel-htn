@@ -1,0 +1,38 @@
+{
+ "people": 65,
+ "imputations": 20,
+ "label": "SBP >= 130 or DBP >= 80 mmHg on one PPG-BP cuff reading (ACC/AHA stage 1)",
+ "prevalence": 0.29615384615384616,
+ "auroc": {
+  "demographics (age band, sex, BMI)": {
+   "mean": 0.7325507544811025,
+   "sd_over_imputations": 0.08148547663111216
+  },
+  "wearable: hand5": {
+   "mean": 0.4288233527129105,
+   "sd_over_imputations": 0.05092827345858495
+  },
+  "wearable: WBM-256": {
+   "mean": 0.43949747957131785,
+   "sd_over_imputations": 0.06781535295445863
+  },
+  "demographics + hand5": {
+   "mean": 0.6988999391109799,
+   "sd_over_imputations": 0.08472272873002157
+  },
+  "demographics + WBM-256": {
+   "mean": 0.5847669650393341,
+   "sd_over_imputations": 0.12276441811975142
+  }
+ },
+ "gain_over_demographics": {
+  "hand5": {
+   "mean": -0.03365081537012245,
+   "sd_over_imputations": 0.03858352428001512
+  },
+  "WBM-256": {
+   "mean": -0.14778378944176848,
+   "sd_over_imputations": 0.09944060833078802
+  }
+ }
+}

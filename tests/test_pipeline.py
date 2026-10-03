@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 import run
-from sentinel import STATES, data
+from sentinel import PULSE, STATES, data
 from sentinel.lifesnaps import load_lifesnaps
 from sentinel.evaluate import metrics
 from sentinel.predict import FEATURE_SETS, local_trend
@@ -22,6 +22,8 @@ KEYS = ['auroc', 'auprc', 'sens_lead_0', 'sens_lead_30', 'sens_lead_90', 'sens_l
 if __name__ == '__main__':
     assert 'STABLE' not in STATES and len(STATES) == 3
     assert all('onset' not in cols for cols in FEATURE_SETS.values())
+    curve = {'0.5': {'alarms_per_nonconv_py': .4, 's': .3}, '0.25': {'alarms_per_nonconv_py': .2, 's': .1}}
+    assert np.allclose([run._at_rate(curve, 's', a) for a in (.1, .3, 1.)], [.05, .2, .3])   # 0 alarms = 0; clamped
     y = np.random.default_rng(0).normal(0, .2, (5, 40))
     ok = y > -.3
     s1 = local_trend(y, ok)[0]
@@ -39,6 +41,14 @@ if __name__ == '__main__':
     dec6 = run.pipeline(daily, people, split, cfg, (models, th), ('mcar', 0.6, {}))[0]
     m6 = metrics(dec6, tp)
     assert m6['abstention_rate'] > m['abstention_rate'], (m['abstention_rate'], m6['abstention_rate'])
+    # optional pulse channels: off by default; used when switched on; all-NaN columns with pulse on behave exactly like
+    # the default (dropped) run
+    assert set(models['weights']) == set(run.CHANNELS) and not {c + '_w' for c in PULSE} & set(wk)
+    d_on = run.pipeline(daily, people, split, {**cfg, 'pulse': True})
+    assert all(d_on[2]['weights'][c] > 0 for c in PULSE) and {c + '_w' for c in PULSE} <= set(d_on[1])
+    d_nan = run.pipeline(daily.assign(**dict.fromkeys(PULSE, np.nan)), people, split, {**cfg, 'pulse': True})
+    pd.testing.assert_frame_equal(d_nan[0], dec)
+    assert d_nan[1].columns.equals(wk.columns) and set(d_nan[2]['weights']) == set(run.CHANNELS)
     # real-world path: test people rewritten in LifeSnaps CSV format -> adapter -> label-free transfer metrics
     t = daily[daily.pid.isin(tp.pid)]
     csv = os.path.join(tempfile.mkdtemp(), 'lifesnaps.csv')

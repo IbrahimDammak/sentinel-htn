@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from scipy.signal import lfilter
 
-from . import CHANNELS, ACUTE_CONTEXT, DAILY_COLUMNS, PEOPLE_COLUMNS, HTN_SBP, HTN_DBP
+from . import CHANNELS, ACUTE_CONTEXT, DAILY_COLUMNS, PEOPLE_COLUMNS, PULSE, HTN_SBP, HTN_DBP, channels
 
 # channel: (person mean, between-person SD, day-to-day SD, day-to-day AR(1) rho, coupling per mmHg of latent dSBP)
 # Calibrated on LifeSnaps (71 people, Fitbit Sense; results/lifesnaps/real_world.md): means, spreads, total
@@ -17,6 +17,17 @@ _CH = {
     'sleep_dur': (6.55, 1.5, 1.45, 0.0, -0.01),
     'sleep_reg': (63, 14.7, 14.5, 0.84, -0.15),     # 7-night rolling proxy -> strongly autocorrelated
 }
+
+# Optional pulse channel pulse_htn (sentinel/pulse.py), simulated scale-free in units of the night-to-night SD. Inputs from
+# PPG-BP on the final head's scale (results/ppg_bp/metrics.json 'simulator_inputs'): clip-level ICC and the age-adjusted
+# BETWEEN-person slope in within-clip SD per mmHg. PPG-BP measures nothing within a person: the night-to-night noise
+# and the within-person coupling are assumptions (PULSE_COUPLING is only the default of make_cohort(pulse_coupling=)).
+# Drawn from a separate generator after every other draw, so all other columns are unchanged.
+_PULSE_STREAM = 1                               # pulse generator = default_rng((seed, _PULSE_STREAM))
+_PULSE_ICC = 0.52                               # clip-level ICC -> between-person SD sqrt(ICC / (1 - ICC)) night SDs
+PULSE_COUPLING = 0.0092                         # night SD per mmHg; ≈ the between-person slope (0.0099), an assumed UPPER bound
+_PULSE_RHO = 0.3
+_PULSE_MISS = 0.10
 
 
 def _ar1(rng, n, sd, rho, burn=60):
@@ -89,23 +100,41 @@ def _person(rng, days, conv, effect=1.0):
     t_ref = float(starts[two[0]]) if len(two) else np.nan
     daily = dict(day=d, month=month, **x, ambient_temp=temp, menses=men, exercise_min=ex,
                  alcohol=alc.astype(float), illness=ill.astype(float), firmware=fw, sqi=sqi,
-                 rhythm_irregular=(rng.random(days) < .01).astype(int), sbp=cs, dbp=cd)
+                 rhythm_irregular=(rng.random(days) < .01).astype(int), sbp=cs, dbp=cd,
+                 _dsbp=dsbp, _gone=gone)                     # for _pulse only (no extra draws), not output
     person = dict(age=int(rng.integers(30, 66)), sex=sex, bmi=rng.uniform(20, 38), skin_ita=ita,
                   converter=not np.isnan(t_ref), t_ref=t_ref, onset=onset, end_day=days - 1)
     return daily, person
 
 
-def make_cohort(n_people=600, days=540, seed=0, converter_rate=0.35, effect=1.0):
-    """Simulate (daily, people) with latent BP drift, confounders, missingness and cuff labels.
-    effect scales the channel-to-BP couplings (1 = calibrated default; >1 = strong-signal sanity cohort for tests)."""
+def _pulse(rng, dsbp, gone, beta):
+    """Optional pulse_htn for one person; NaN wherever the core channels are missing.
+    beta = within-person coupling, night SD per mmHg of latent dSBP."""
+    days = len(dsbp)
+    has = ~gone & (rng.random(days) >= _PULSE_MISS)   # assumption: 10% of worn nights have no clean clip
+    # assumption: night-to-night SD = the clip-to-clip SD (= 1 unit; night-to-night not measured, no sqrt(n) gain from
+    # the nightly median), AR(1) rho 0.3, between-person SD from the clip-level ICC; within-person coupling beta.
+    htn = rng.normal(0, np.sqrt(_PULSE_ICC / (1 - _PULSE_ICC))) + beta * dsbp + _ar1(rng, days, 1.0, _PULSE_RHO)
+    # assumption: no acute-context or skin-tone effects on the pulse channel beyond the shared missingness
+    return np.where(has, htn, np.nan)
+
+
+def make_cohort(n_people=600, days=540, seed=0, converter_rate=0.35, effect=1.0, pulse_coupling=PULSE_COUPLING):
+    """Simulate (daily, people) with latent BP drift, confounders, missingness and cuff labels, plus the optional
+    PULSE columns (separate generator, drawn last: every other column is identical to a cohort without them).
+    effect scales the channel-to-BP couplings (1 = calibrated default; >1 = strong-signal sanity cohort for tests);
+    pulse_coupling = assumed within-person pulse coupling, night SD per mmHg (0 = pulse channels carry no BP signal)."""
     rng = np.random.default_rng(seed)
     pids = [f'P{i:04d}' for i in range(n_people)]
     ds, ps = zip(*[_person(rng, days, rng.random() < converter_rate, effect) for _ in pids])
+    prng = np.random.default_rng((seed, _PULSE_STREAM))
+    for d in ds:
+        d['pulse_htn'] = _pulse(prng, d.pop('_dsbp'), d.pop('_gone'), effect * pulse_coupling)
     daily = pd.DataFrame({k: np.concatenate([d[k] for d in ds]) for k in ds[0]})
     daily.insert(0, 'pid', np.repeat(pids, days))
     people = pd.DataFrame(list(ps))
     people.insert(0, 'pid', pids)
-    return daily[DAILY_COLUMNS], people[PEOPLE_COLUMNS]
+    return daily[DAILY_COLUMNS + PULSE], people[PEOPLE_COLUMNS]
 
 
 def load_csv(daily_path, people_path):
@@ -138,7 +167,7 @@ def perturb(daily, kind, level, seed=0, channel=None, people=None):
     """Return a perturbed copy of daily (see CONTRACT.md for kinds); the input is never modified."""
     rng = np.random.default_rng(seed)
     out = daily.copy()
-    chs = [channel] if channel else CHANNELS
+    chs = [channel] if channel else channels(out)
     if kind == 'mcar':
         v = out[chs].to_numpy(float, copy=True)
         v[rng.random(v.shape) < level] = np.nan
@@ -152,7 +181,7 @@ def perturb(daily, kind, level, seed=0, channel=None, people=None):
         ita = out['pid'].map(people.set_index('pid')['skin_ita']).to_numpy(float)
         w = 1 / (1 + np.exp((ita - 10) / 15))                    # darker skin -> more missing
         gone = rng.random(len(out)) < np.clip(level * w / w.mean(), 0, 1)
-        out.loc[gone, CHANNELS] = np.nan
+        out.loc[gone, chs] = np.nan
     elif kind == 'sensor_fail':
         key, inv = np.unique(out['pid'].astype(str) + '_' + (out['day'] // 14).astype(str), return_inverse=True)
         out.loc[(rng.random(len(key)) < level)[inv], 'sqi'] = 0.0
@@ -189,5 +218,18 @@ if __name__ == '__main__':
     a, _ = make_cohort(20, 300, seed=1)
     b, _ = make_cohort(20, 300, seed=1)
     pd.testing.assert_frame_equal(a, b)
+    # pulse channel: missing whenever the core channels are; drop_channel takes the PULSE list; rises after
+    # onset in a strong-coupling cohort (at effect=1 the rise is far below the noise, by design)
+    assert daily.loc[daily[CHANNELS].isna().all(axis=1), PULSE].isna().all().all()
+    assert daily[PULSE].notna().mean().between(0.5, 0.8).all(), daily[PULSE].notna().mean()
+    assert perturb(daily, 'drop_channel', 1, channel=PULSE)[PULSE].isna().all().all()
+    def pulse_rise(coupling):
+        s, sp = make_cohort(150, 540, seed=2, effect=10.0, pulse_coupling=coupling)
+        s = s.merge(sp[['pid', 'onset']], on='pid')
+        s = s[s.onset.notna()]
+        late = s.day >= s.onset + 120
+        return (s[late].groupby('pid')[PULSE].mean() - s[~late].groupby('pid')[PULSE].mean()).mean()
+    rise, rise0 = pulse_rise(PULSE_COUPLING), pulse_rise(0.0)
+    assert (rise > 0).all() and (rise0.abs() < 0.15).all(), (rise, rise0)   # coupling 0: no BP signal in pulse
     print(f'ok: {dt:.1f}s converter={conv:.2f} missing={miss:.2f} dark={(people.skin_ita < 10).mean():.2f} '
-          f'rhr_shift={(g[True] - g[False]).mean():.2f}')
+          f'rhr_shift={(g[True] - g[False]).mean():.2f} pulse_rise(effect 10)={rise.round(2).to_dict()}')

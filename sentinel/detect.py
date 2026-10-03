@@ -2,26 +2,29 @@
 import numpy as np
 import pandas as pd
 
-from . import CHANNELS
+from . import CHANNELS, channels
 
 WEEKS_PER_YEAR = 365.25 / 7
 
 
 def channel_weights(wk, evidence):
     """Label-free weights: evidence prior / variance of the channel's weekly mean z on evaluable weeks.
-    Channels whose noise does not average out within a week (autocorrelated, e.g. smoothed resting HR) count less."""
-    var = wk.loc[wk['evaluable'], [c + '_w' for c in CHANNELS]].var()
-    return {c: float(evidence[c] / var[c + '_w']) for c in CHANNELS}
+    Channels whose noise does not average out within a week (autocorrelated, e.g. smoothed resting HR) count less.
+    A channel without a usable variance (no data, < 2 evaluable weeks) gets weight 0, never NaN."""
+    chs = channels(wk, '_w')
+    var = wk.loc[wk['evaluable'], [c + '_w' for c in chs]].var()
+    return {c: float(evidence[c] / var[c + '_w']) if var[c + '_w'] > 0 else 0.0 for c in chs}
 
 
 def weekly(resid, weights=None):
     """Per pid-week channel means, joint deviation `dev` (weighted mean of available channels; equal weights if None)
-    and evaluability. Absent weeks appear as non-evaluable."""
-    zc = [c + '_z' for c in CHANNELS]
+    and evaluability. Absent weeks appear as non-evaluable. Channels: CHANNELS + PULSE channels with any z."""
+    chs = channels(resid, '_z')
+    zc = [c + '_z' for c in chs]
     g = resid.assign(week=resid['day'] // 7).groupby(['pid', 'week'])
     wk = g[zc].mean().where(g[zc].count() >= 3)                       # NaN if < 3 days
-    wk.columns = [c + '_w' for c in CHANNELS]
-    w = np.array([1.0 if weights is None else weights[c] for c in CHANNELS])
+    wk.columns = [c + '_w' for c in chs]
+    w = np.array([1.0 if weights is None else weights.get(c, 0.0) for c in chs])   # unknown channel -> 0
     wk['dev'] = (wk.fillna(0) * w).sum(axis=1) / (wk.notna() * w).sum(axis=1).replace(0, np.nan)
     wk['n_valid'] = g['valid'].sum()
     wk['evaluable'] = (wk['n_valid'] >= 4) & (g['baseline_ready'].mean() > 0.5) & wk['dev'].notna()

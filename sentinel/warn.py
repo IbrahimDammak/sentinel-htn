@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 
-from . import CHANNELS, STATES
+from . import CHANNELS, PULSE, STATES
 
 
 def _state(pred, thr_p, min_valid_30):
@@ -41,6 +41,28 @@ def tune_warning(pred, people, budget=0.5, grid=None):
     return float(np.max(grid))
 
 
+# Repeat suppression: 26 weeks, chosen to equal the 26-week prediction horizon (not the clinical panel's rule,
+# which was 13 weeks after a normal cuff series; 13 weeks gives 0.28 vs 0.25 prompts/py), so a person is
+# asked for at most one confirmatory home-BP week per horizon. A burden metric only: states, first warnings, tuned
+# thresholds and the chance floor are untouched.
+REFRACTORY_WEEKS = 26
+
+
+def prompts(dec, refractory=REFRACTORY_WEEKS):
+    """Boolean Series (dec's index): WARNING episode starts that become prompts once any start within `refractory`
+    weeks after the person's previous prompt is suppressed. Every person's first start is always a prompt."""
+    d = dec.sort_values(['pid', 'week'])
+    w, pid, week = (d.state == 'WARNING').to_numpy(), d.pid.to_numpy(), d.week.to_numpy()
+    out = w & ~(np.r_[False, w[:-1]] & np.r_[False, pid[1:] == pid[:-1]])
+    last = {}
+    for i in np.flatnonzero(out):
+        if week[i] - last.get(pid[i], -np.inf) <= refractory:
+            out[i] = False
+        else:
+            last[pid[i]] = week[i]
+    return pd.Series(out, d.index).reindex(dec.index)
+
+
 def first_warnings(dec):
     """Per person: first WARNING week and its day (end of that landmark week, 7*week+6; NaN if never)."""
     out = pd.DataFrame({'pid': dec.pid.unique()})
@@ -65,7 +87,7 @@ def ledger(dec, wk, pid, week):
         'weeks_exceeded': '%d/%d' % (r.n_exceed, r.n_eval),   # n_exceed / n_eval
         'episodes': _num(last.episodes.iloc[0], int) if len(last) and 'episodes' in last else None,
         'dev_slope12': _num(r.dev_slope12),
-        'channel_contrib': {c: _num(w6[c + '_w'].mean()) for c in CHANNELS if c + '_w' in w6},
+        'channel_contrib': {c: _num(w6[c + '_w'].mean()) for c in CHANNELS + PULSE if c + '_w' in w6},
         'valid_days_30': _num(r.valid_days_30, int),
         'ctx_masked_6w': _num(w6.ctx_masked.sum(), int) if 'ctx_masked' in w6 else None,
         'month': _num(r.month, int) if 'month' in r else None,
@@ -96,6 +118,11 @@ if __name__ == '__main__':
     thr = tune_warning(pred, people, budget=0.5)   # d alone would give 1 episode/yr > 0.5 at thr <= 0.6
     assert thr > 0.6 and 0 <= thr <= 1.01, thr
     assert tune_warning(pred, people, budget=5) == 0.0
+    pr = prompts(dec, refractory=4)   # a: starts at weeks 2 and 6 (6 - 2 <= 4 suppressed); d: one start
+    assert prompts(dec, 3).sum() == 3 and pr.sum() == 2 and dec[pr].groupby('pid').week.min().to_dict() == {'a': 2, 'd': 0}
+    sp = pd.DataFrame({'pid': 'e', 'week': range(40), 'state': ['WARNING' if w in (1, 5, 6, 30, 33) else 'INSUFFICIENT'
+                                                              for w in range(40)]})
+    assert sp.week[prompts(sp)].tolist() == [1, 30] and sp.week[prompts(sp, 0)].tolist() == [1, 5, 30, 33]   # 5, 33 within 26 wk
     wk = pd.DataFrame({'pid': 'a', 'week': range(8), 'ctx_masked': 1, 'episodes': 1, 'night_rhr_w': 0.8, 'steps_w': np.nan})
     led = ledger(dec, wk, 'a', 6)
     assert led['state'] == 'WARNING' and abs(led['channel_contrib']['night_rhr'] - 0.8) < 1e-9 and led['ctx_masked_6w'] == 6
