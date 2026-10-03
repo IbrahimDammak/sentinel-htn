@@ -483,6 +483,8 @@ def main():
     ap.add_argument('--sweep', nargs='+', help='run roots (one per pulse coupling): write --out/coupling_sweep.md and exit')
     ap.add_argument('--pulse-coupling', type=float, default=data.PULSE_COUPLING,
                     help='synthetic: assumed within-person pulse coupling, night SD per mmHg (0 = no BP signal)')
+    ap.add_argument('--noise-csv', help='synthetic: LifeSnaps daily csv whose real residual blocks replace the AR(1) '
+                                        'noise (noise transplant, sentinel/realnoise.py)')
     a = ap.parse_args()
     if a.summary:
         return summarise(a.summary, a.ref)
@@ -491,8 +493,13 @@ def main():
     if not a.synthetic and not (a.daily and a.people) and not a.lifesnaps:
         ap.error('give --synthetic, both --daily and --people, --lifesnaps, --summary or --sweep')
     n, days, n_boot = (150, 360, 5) if a.quick else (a.n, a.days, BASE['n_boot'])
+    bank = None
+    if a.noise_csv:
+        from sentinel.lifesnaps import load_lifesnaps
+        from sentinel.realnoise import Bank
+        bank = Bank(load_lifesnaps(a.noise_csv)[0])
     daily, people = (data.load_csv(a.daily, a.people) if a.daily else
-                     data.make_cohort(n, days, a.seed, pulse_coupling=a.pulse_coupling))
+                     data.make_cohort(n, days, a.seed, pulse_coupling=a.pulse_coupling, noise_bank=bank))
     split = make_split(people, a.seed)
     tp = people[people.pid.isin(split['test'])]
     cfg = {**BASE, 'n_boot': n_boot, 'seed': a.seed}

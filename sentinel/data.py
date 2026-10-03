@@ -24,6 +24,7 @@ _CH = {
 # and the within-person coupling are assumptions (PULSE_COUPLING is only the default of make_cohort(pulse_coupling=)).
 # Drawn from a separate generator after every other draw, so all other columns are unchanged.
 _PULSE_STREAM = 1                               # pulse generator = default_rng((seed, _PULSE_STREAM))
+_NOISE_STREAM = 2                               # real-noise transplant generator (sentinel/realnoise.py)
 _PULSE_ICC = 0.52                               # clip-level ICC -> between-person SD sqrt(ICC / (1 - ICC)) night SDs
 PULSE_COUPLING = 0.0092                         # night SD per mmHg; ≈ the between-person slope (0.0099), an assumed UPPER bound
 _PULSE_RHO = 0.3
@@ -44,8 +45,10 @@ def _spans(rng, days, per_year, lo, hi):
     return m
 
 
-def _person(rng, days, conv, effect=1.0):
-    """One person's daily arrays (dict) and people-row fields (dict)."""
+def _person(rng, days, conv, effect=1.0, noise=None):
+    """One person's daily arrays (dict) and people-row fields (dict). noise = optional (days x channels) standardised
+    real residuals (sentinel/realnoise.py) that replace the AR(1) noise; the AR(1) draws still happen, so every other
+    column is unchanged."""
     d = np.arange(days)
     sex = 'F' if rng.random() < .5 else 'M'
     ita = float(np.clip(rng.normal(23, 30), -40, 70))          # ~1/3 below 10
@@ -73,7 +76,11 @@ def _person(rng, days, conv, effect=1.0):
         men = ((d + rng.integers(0, 28)) % 28 >= 14).astype(float)   # luteal phase = 1
     fw = (d >= rng.integers(0, days)).astype(int) if rng.random() < .3 else np.zeros(days, int)
     # channels
-    x = {c: rng.normal(mu, sd) + effect * k * dsbp + _ar1(rng, days, sdd, rho) for c, (mu, sd, sdd, rho, k) in _CH.items()}
+    x = {}
+    for j, (c, (mu, sd, sdd, rho, k)) in enumerate(_CH.items()):
+        level = rng.normal(mu, sd)                    # draw order as before: person level, then AR(1)
+        ar = _ar1(rng, days, sdd, rho)
+        x[c] = level + effect * k * dsbp + (ar if noise is None else sdd * noise[:, j])
     x['night_rhr'] += 0.05 * cold + 5 * ill + 3 * alc + 2 * (ex > 45) + 2 * (men == 1) + 1.5 * fw
     x['night_rmssd'] += -8 * ill - 6 * alc
     x['steps'] = np.maximum(x['steps'], 0)
@@ -119,14 +126,19 @@ def _pulse(rng, dsbp, gone, beta):
     return np.where(has, htn, np.nan)
 
 
-def make_cohort(n_people=600, days=540, seed=0, converter_rate=0.35, effect=1.0, pulse_coupling=PULSE_COUPLING):
+def make_cohort(n_people=600, days=540, seed=0, converter_rate=0.35, effect=1.0, pulse_coupling=PULSE_COUPLING,
+                noise_bank=None):
     """Simulate (daily, people) with latent BP drift, confounders, missingness and cuff labels, plus the optional
     PULSE columns (separate generator, drawn last: every other column is identical to a cohort without them).
     effect scales the channel-to-BP couplings (1 = calibrated default; >1 = strong-signal sanity cohort for tests);
-    pulse_coupling = assumed within-person pulse coupling, night SD per mmHg (0 = pulse channels carry no BP signal)."""
+    pulse_coupling = assumed within-person pulse coupling, night SD per mmHg (0 = pulse channels carry no BP signal);
+    noise_bank = realnoise.Bank: real LifeSnaps residual blocks replace the AR(1) noise (own generator, so people,
+    drifts, confounders, missingness and cuffs are identical to the AR(1) cohort)."""
     rng = np.random.default_rng(seed)
+    nrng = np.random.default_rng((seed, _NOISE_STREAM))
     pids = [f'P{i:04d}' for i in range(n_people)]
-    ds, ps = zip(*[_person(rng, days, rng.random() < converter_rate, effect) for _ in pids])
+    ds, ps = zip(*[_person(rng, days, rng.random() < converter_rate, effect,
+                           None if noise_bank is None else noise_bank.draw(nrng, days)) for _ in pids])
     prng = np.random.default_rng((seed, _PULSE_STREAM))
     for d in ds:
         d['pulse_htn'] = _pulse(prng, d.pop('_dsbp'), d.pop('_gone'), effect * pulse_coupling)
