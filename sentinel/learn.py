@@ -62,11 +62,13 @@ def fit_prior(daily, warmup_days=56):
     return prior
 
 
-def personal_baseline(daily, prior, warmup_valid=28, personal=True):
+def personal_baseline(daily, prior, warmup_valid=28, personal=True, moments=False):
     """Signed, robust z per channel against a normal-normal posterior personal baseline.
 
     Needs `<ch>_adj`, `valid`, `ctx_masked`. Warm-up (first `warmup_valid` valid days, restarted at every
     firmware change) gives baseline_ready=False and NaN z. personal=False uses the population prior only.
+    moments=True also returns the posterior person mean m_i and variance v_i used for z as `<ch>_m`, `<ch>_v`
+    (context-adjusted scale; for the agents' usual range, sentinel/agents.py). z is unchanged either way.
     """
     d = daily.sort_values(['pid', 'day']).reset_index(drop=True)
     fw = d['firmware'].fillna(0)
@@ -86,6 +88,8 @@ def personal_baseline(daily, prior, warmup_valid=28, personal=True):
         else:
             m, v = p['mu0'], p['tau'] ** 2
         out[ch + '_z'] = (sign * (x - m) / np.sqrt(p['sigma'] ** 2 + v)).where(ready).clip(-6, 6)
+        if moments:
+            out[ch + '_m'], out[ch + '_v'] = m, v
     out['valid'], out['ctx_masked'], out['baseline_ready'] = d['valid'], d['ctx_masked'], ready
     return out
 

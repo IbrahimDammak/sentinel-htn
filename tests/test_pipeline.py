@@ -5,13 +5,15 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import json
+import subprocess
 import tempfile
 
 import numpy as np
 import pandas as pd
 
 import run
-from sentinel import PULSE, STATES, data
+from sentinel import PULSE, STATES, agents, data, learn
 from sentinel.lifesnaps import load_lifesnaps
 from sentinel.evaluate import metrics
 from sentinel.predict import FEATURE_SETS, local_trend
@@ -58,4 +60,94 @@ if __name__ == '__main__':
                   'age': '<30', 'gender': 'MALE', 'bmi': '23.0'}).to_csv(csv)
     rw = run.real_world(*load_lifesnaps(csv), cfg, (models, th))
     assert rw['people'] == tp.pid.nunique() and 0 <= rw['abstention_rate'] <= 1 and rw['warning_episodes_py'] >= 0, rw
+
+    # ---- agent audit layer (sentinel/agents.py)
+    # personal_baseline moments leave every z value unchanged
+    g = run._adjust(learn.quality_gate(daily[daily.pid.isin(split['test'])].drop(columns=PULSE)), models['ctx'])
+    r0, r1 = learn.personal_baseline(g, models['prior']), learn.personal_baseline(g, models['prior'], moments=True)
+    pd.testing.assert_frame_equal(r0, r1[r0.columns])
+    assert {c + s for c in run.CHANNELS for s in ('_m', '_v')} == set(r1.columns) - set(r0.columns)
+
+    # seeded random loop: the audit never upgrades, never touches POOR_QUALITY, every veto removes a whole episode
+    rng = np.random.default_rng(0)
+    n_cases = n_vetoes = 0
+    for case in range(1000):
+        rows = []
+        for i in range(rng.integers(1, 5)):
+            st = rng.choice(STATES)
+            for w in range(rng.integers(3, 80)):
+                st = st if rng.random() < .8 else rng.choice(STATES)
+                rows.append((f'p{i}', w, st))
+        dec_r = pd.DataFrame(rows, columns=['pid', 'week', 'state']).sample(frac=1, random_state=case)
+        pv = rng.random()
+        out, cs = agents.audit_loop(dec_r, lambda cur, p, w: {'auditor': {'final_state': 'INSUFFICIENT' if rng.random() < pv else 'WARNING'}})
+        b, a = dec_r.sort_values(['pid', 'week']), out.sort_values(['pid', 'week'])
+        ch = b.state.to_numpy() != a.state.to_numpy()
+        assert ((b.state[ch] == 'WARNING') & (a.state[ch] == 'INSUFFICIENT')).all()          # never upgrades
+        assert ((b.state == 'POOR_QUALITY') == (a.state == 'POOR_QUALITY')).all()            # POOR_QUALITY untouched
+        isw = b.state.eq('WARNING')
+        ep = (isw & ~(isw.shift(fill_value=False) & b.pid.eq(b.pid.shift()))).cumsum().where(isw, 0)
+        assert pd.Series(ch, b.index)[isw].groupby(ep[isw]).nunique().max() <= 1 if isw.any() else True  # whole episodes
+        for (p, w), c in cs.items():                                                         # each veto = its episode gone
+            e = ep[(b.pid == p) & (b.week == w)].iloc[0]
+            assert e > 0 and (a.state[ep == e] == ('WARNING' if c['auditor']['final_state'] == 'WARNING' else 'INSUFFICIENT')).all()
+        assert all(k in cs for k in zip(out.pid[run.warn.prompts(out)], out.week[run.warn.prompts(out)]))  # all prompts audited
+        n_cases += len(cs)
+        n_vetoes += sum(c['auditor']['final_state'] != 'WARNING' for c in cs.values())
+    assert n_cases > 1000 and 0 < n_vetoes < n_cases, (n_cases, n_vetoes)
+
+    # the layer on the real pipeline output; same input -> identical records
+    ag, dec_a, cases = run.agent_layer(daily, people, split, cfg, dec, wk, models, th)
+    assert cases and json.dumps(run._clean(cases)) == json.dumps(run._clean(run.agent_layer(daily, people, split, cfg, dec, wk, models, th)[2]))
+    agents.check_invariants(dec, dec_a)
+    for c in cases:
+        assert not agents.validate(c['profiler'], agents.PROFILE_SPEC) and not agents.validate(c['predictor'], agents.PREDICTOR_SPEC)
+        assert not agents.validate(c['auditor'], agents.AUDITOR_SPEC) and c['predictor']['agrees_with_pipeline']
+        assert c['predictor']['p_lo'] == dec_a.set_index(['pid', 'week']).p_lo[(c['predictor']['pid'], c['predictor']['week'])]
+    assert ag['counts']['prompts_audited'] == len(cases) and set(ag['failed_checks']) == set(agents.CHECKS)
+
+    # broken ref -> rejected (returned once, the reason dropped); BP number -> rejected (veto)
+    c0 = cases[0]
+    pf = {k: v for k, v in c0['profiler'].items() if k not in ('concerns', 'summary')}
+    pf['quality'] = {**pf['quality'], 'ctx_masked_weekly': [0] * len(pf['quality']['ctx_masked_weekly'])}
+    qf = {k: v for k, v in c0['predictor'].items() if k in ('pid', 'week', 'p', 'p_lo', 'p_hi', 'thr_p', 'cuff', 'pipeline_state', 'imputed_inputs')}
+    tb = agents.template_backend()
+    def with_reason(claim, ref, only=False):
+        def predict(ns):
+            o = tb['predict'](ns)
+            return {**o, 'reasons': ([] if only else o['reasons']) + [{'claim': claim, 'ref': ref}]}
+        return {**tb, 'predict': predict}
+    ok = agents.audit_case(pf, qf, th['thr_p'], tb)
+    assert ok['auditor']['verdict'] == 'approve' and ok['auditor']['final_state'] == 'WARNING' and ok['returned'] is None
+    br = agents.audit_case(pf, qf, th['thr_p'], with_reason('Made-up field.', 'predictor.no_such_field'))
+    first = {x['name']: x['pass'] for x in br['returned']['auditor']['checks']}
+    assert not first['refs_resolve'] and br['returned']['auditor']['verdict'] == 'return_once'
+    assert br['auditor']['verdict'] == 'approve' and all(r['ref'] != 'predictor.no_such_field' for r in br['predictor']['reasons'])
+    only = agents.audit_case(pf, qf, th['thr_p'], with_reason('Made-up field.', 'predictor.no_such_field', only=True))
+    assert only['auditor']['verdict'] == 'veto' and only['auditor']['final_state'] == 'INSUFFICIENT'
+    bp = agents.audit_case(pf, qf, th['thr_p'], with_reason('Estimated SBP 142 mmHg.', 'predictor.p'))
+    assert bp['auditor']['verdict'] == 'veto' and not {x['name']: x['pass'] for x in bp['auditor']['checks']}['no_bp_number']
+    try:
+        agents.llm_backend()
+        raise AssertionError('llm_backend must be a stub')
+    except NotImplementedError:
+        pass
+
+    # CLI: with --agents off, outputs are those of the agents run minus every agent key / section
+    tmp = tempfile.mkdtemp()
+    for flag in ([], ['--agents']):
+        subprocess.run([sys.executable, 'run.py', '--synthetic', '--quick', '--seed', '0', '--out', os.path.join(tmp, str(len(flag))), *flag],
+                       check=True, capture_output=True, cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    off, on = (json.load(open(os.path.join(tmp, k, 'metrics.json'))) for k in '01')
+    assert 'agents' not in off and not os.path.exists(os.path.join(tmp, '0', 'agent_records.json'))
+    on.pop('agents')
+    if on['ledger']:
+        on['ledger'].pop('agents')
+    assert on == off
+    rep_off, rep_on = (open(os.path.join(tmp, k, 'report.md')).read() for k in '01')
+    assert '## Agent audit layer' in rep_on and '## Agent audit layer' not in rep_off
+    head, rest = rep_on.split('\n\n## Agent audit layer')
+    assert head + '\n\nFigures:' + rest.split('\n\nFigures:')[1] == rep_off
+    print('agents test OK', ag['counts'])
+
     print('pipeline test OK', {k: round(m[k], 3) for k in ('auroc', 'abstention_rate')}, 'mcar0.6 abstention', round(m6['abstention_rate'], 3))

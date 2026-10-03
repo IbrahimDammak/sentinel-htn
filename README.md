@@ -89,6 +89,16 @@ unchanged without them and never imports torch.
 - **WBM** from OpenMHC (`sentinel/wbm.py`): hourly week of 19 phone/watch channels plus missingness flags (168 x 38)
   -> 256-d. Probed on real LifeSnaps data; its drift channel is planned, not yet in the pipeline.
 
+### Optional agent audit layer
+
+`sentinel/agents.py` (`run.py --agents`, main model only) mirrors the stages with three agents: a **Profiler**
+(Learn + Detect facts about one person's recent weeks), a **Predictor** (the pipeline's risk, copied, and a proposed
+state) and an **Auditor** that checks each prompt against the evidence and the gates and approves or vetoes it. Its
+purpose is traceability (every claim cites a field of the record) and a conservative second check, **not** better
+discrimination: the only allowed change is downgrading a whole WARNING episode to INSUFFICIENT, enforced in code.
+Only a deterministic template backend exists (no API key). On the simulator its one live check (acute-context
+confounding) vetoes many prompts at a real cost in early detections; see `results/agents/summary.md`.
+
 ## Data and validation
 
 No public dataset follows the same people with wearables until a hypertension diagnosis, so each dataset answers
@@ -157,6 +167,8 @@ python run.py --synthetic --n 1200 --seed 0 --out results/pulse/seed0   # paper 
 python run.py --summary results/pulse --ref results/weighted              # mean +- SD; main must equal results/weighted
 python run.py --daily daily.csv --people people.csv --out results   # organiser data (schema in CONTRACT.md)
 python run.py --lifesnaps data/lifesnaps/rais_anonymized/csv_rais_anonymized/daily_fitbit_sema_df_unprocessed.csv --n 1200 --out results/lifesnaps
+python run.py --synthetic --n 1200 --seed 0 --agents --out results/agents/seed0   # + agent audit layer
+python -m sentinel.agents --summary results/agents          # before vs after audit, mean +- SD over seeds
 python tests/test_pipeline.py                               # end-to-end test (~10 s)
 python -m sentinel.evaluate                                 # metric self-check against hand-computed values
 ```
@@ -217,6 +229,7 @@ E robustness, F uncertainty quality (AURC, abstention rate). "specificity" is cu
 |---|---|
 | `sentinel/` | the four pipeline stages (`learn`, `detect`, `predict`, `warn`), metrics (`evaluate`), simulator and loaders (`data`, `lifesnaps`) |
 | `sentinel/pulse.py`, `wbm.py` | optional frozen foundation-model encoders (PaPaGei-S, WBM) |
+| `sentinel/agents.py` | optional agent audit layer (`--agents`): Profiler, Predictor, Auditor; template backend |
 | `sentinel/realnoise.py`, `matched.py` | real-noise stress tests (noise transplant, plasmode) and the matched-cohort negative control |
 | `run.py`, `tests/` | CLI and end-to-end test |
 | `CONTRACT.md` | data schema and module APIs (use it to plug in the organiser dataset) |

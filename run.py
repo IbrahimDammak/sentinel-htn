@@ -4,6 +4,7 @@
   python run.py --daily d.csv --people p.csv --out results/
   python run.py --summary results/pulse [--ref results/weighted]   # mean +- SD over results/pulse/seed*/metrics.json
   python run.py --sweep results/pulse/coupling_0 results/pulse results/pulse/coupling_2x --out results/pulse
+  python run.py --synthetic --n 1200 --seed 0 --agents --out results/agents/seed0   # + agent audit layer (main model)
 """
 import argparse
 import glob
@@ -306,6 +307,9 @@ def write_report(path, res, args_str):
                                     for c in res['operating_curve'].values()) + ' |' for b in BUDGETS]
     L += ['', '## Example evidence ledger (first warning of a warned converter)', '']
     L += ['```json', json.dumps(_clean(res['ledger']), indent=2), '```'] if res['ledger'] else ['No converter was warned before t_ref in the test set.']
+    if 'agents' in res:   # only with --agents; otherwise the report is unchanged
+        from sentinel import agents
+        L += [''] + agents.report_lines(res['agents'])[:-1]
     L += ['', 'Figures: `calibration.png`, `lead_time.png`, `risk_coverage.png`, `lead_vs_budget.png`.', '']
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(L))
@@ -467,6 +471,21 @@ def coupling_sweep(dirs, out):
     print('\n'.join(L))
 
 
+def agent_layer(daily, people, split, cfg, dec, wk, models, th):
+    """--agents: the audit layer on the main model's test decisions (sentinel/agents.py, imported lazily) ->
+    (metrics block, audited dec, cases). The personal-baseline moments are recomputed for the test people with the
+    pipeline's own fitted context and prior."""
+    from sentinel import agents
+    dt = daily[daily.pid.isin(split['test'])]
+    if not cfg['pulse']:
+        dt = dt.drop(columns=PULSE, errors='ignore')
+    d = _adjust(learn.quality_gate(dt), models['ctx'])
+    resid = learn.personal_baseline(d, models['prior'], personal=cfg['personal'], moments=True)
+    dec_a, cases = agents.run(dec, wk, resid, models['prior'], th['thr_p'], cols=predict.FEATURE_SETS[cfg['features']])
+    tp = people[people.pid.isin(split['test'])]
+    return agents.compare(dec, dec_a, cases, tp, models['pred_cal'], chance_floor), dec_a, cases
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--synthetic', action='store_true')
@@ -485,6 +504,8 @@ def main():
                     help='synthetic: assumed within-person pulse coupling, night SD per mmHg (0 = no BP signal)')
     ap.add_argument('--noise-csv', help='synthetic: LifeSnaps daily csv whose real residual blocks replace the AR(1) '
                                         'noise (noise transplant, sentinel/realnoise.py)')
+    ap.add_argument('--agents', action='store_true', help='run the agent audit layer (sentinel/agents.py) after Warn '
+                                                          'on the main model; adds agent keys to metrics.json/report.md')
     a = ap.parse_args()
     if a.summary:
         return summarise(a.summary, a.ref)
@@ -543,6 +564,13 @@ def main():
     res['by_age'] = by_group(dec, tp, 'age', 3, models['pred_cal']).to_dict('index')
     res['ledger'] = example_ledger(dec, wk, tp)
     res['ledger_with_pulse'] = example_ledger(wp[0], wp[1], tp)
+    if a.agents:
+        res['agents'], _, cases = agent_layer(daily, people, split, cfg, dec, wk, models, th)
+        if res['ledger']:
+            key = (res['ledger']['pid'], res['ledger']['week'])
+            res['ledger']['agents'] = next((c for c in cases if (c['auditor']['pid'], c['auditor']['week']) == key), None)
+        with open(os.path.join(a.out, 'agent_records.json'), 'w') as f:
+            json.dump(_clean(cases), f, indent=2)
 
     with open(os.path.join(a.out, 'metrics.json'), 'w') as f:
         json.dump(_clean(res), f, indent=2)
