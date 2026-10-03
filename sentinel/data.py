@@ -78,7 +78,7 @@ def _person(rng, days, conv, effect=1.0, noise=None):
     # channels
     x = {}
     for j, (c, (mu, sd, sdd, rho, k)) in enumerate(_CH.items()):
-        level = rng.normal(mu, sd)                    # draw order as before: person level, then AR(1)
+        level = rng.normal(mu, sd)                    # draw order fixed: person level, then AR(1)
         ar = _ar1(rng, days, sdd, rho)
         x[c] = level + effect * k * dsbp + (ar if noise is None else sdd * noise[:, j])
     x['night_rhr'] += 0.05 * cold + 5 * ill + 3 * alc + 2 * (ex > 45) + 2 * (men == 1) + 1.5 * fw

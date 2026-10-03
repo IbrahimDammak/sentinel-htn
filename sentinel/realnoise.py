@@ -4,7 +4,7 @@
    (LifeSnaps, standardised per person-channel, rescaled to the calibrated SD). Variance is unchanged by design; what
    becomes real is the noise SHAPE: autocorrelation inside a block, heavy tails and cross-channel correlation (all six
    channels are drawn jointly from the same person-days; a channel missing anywhere in that block falls back to its own
-   complete block). Used by make_cohort(noise_bank=...) and `run.py --noise lifesnaps`.
+   complete block). Used by make_cohort(noise_bank=...) and `run.py --noise-csv`.
 2. Plasmode injection: real LifeSnaps series (real noise AND real missingness) get a simulated BP drift added at a
    known onset; each person is scored twice, injected and untouched, so every person is their own control. Detect-level
    only (LifeSnaps has no cuff readings, so no t_ref): detected = the persistence ("watch") tier fires after onset.
@@ -93,8 +93,7 @@ def inject(daily, onset, size):
     from .data import _CH
     d = daily.copy()
     on, sz = d.pid.map(onset).to_numpy(float), d.pid.map(size).to_numpy(float)
-    ramp = np.clip((d.day.to_numpy() - on) / RAMP, 0, 1) * sz
-    ramp = np.nan_to_num(ramp)
+    ramp = np.nan_to_num(np.clip((d.day.to_numpy() - on) / RAMP, 0, 1) * sz)
     for c in CHANNELS:
         d[c] = d[c] + _CH[c][4] * ramp
     d['steps'] = d['steps'].clip(lower=0)
@@ -135,7 +134,7 @@ def plasmode(daily, cfg, thr, seed=0):
     rng = np.random.default_rng(seed)
     wk0, ready = _watch(daily, cfg, thr)
     end = daily.groupby('pid').day.max()
-    onset = (ready + AFTER_READY)
+    onset = ready + AFTER_READY
     onset = onset[end.reindex(onset.index) - onset >= MIN_AFTER]
     reps = []
     for _ in range(REPS):
@@ -163,8 +162,8 @@ def main(csv, out=os.path.join('results', 'plasmode'), n=600, seed=0):
     bank = Bank(real)
     # synthetic training -> persistence threshold (as in the paper's main run)
     sd, sp = data.make_cohort(1200, 540, seed)
-    _, _, _, th = run.pipeline(sd, sp, run.make_split(sp, seed), {**run.BASE, 'seed': seed})
-    cfg, thr = {**run.BASE, 'seed': seed}, th['thr']
+    cfg = {**run.BASE, 'seed': seed}
+    thr = run.pipeline(sd, sp, run.make_split(sp, seed), cfg)[3]['thr']
     lengths = real.groupby('pid').day.max().to_numpy()
     res = {'threshold': thr, 'block_days': BLOCK, 'ramp_days': RAMP, 'drift_mmHg': DRIFT, 'reps': REPS}
     res['real (plasmode)'] = plasmode(real, cfg, thr, seed)

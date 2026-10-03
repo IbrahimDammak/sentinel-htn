@@ -84,7 +84,7 @@ def ledger(dec, wk, pid, week):
     return {
         'state': str(r.state),
         'p': _num(r.p), 'p_lo': _num(r.p_lo), 'p_hi': _num(r.p_hi),
-        'weeks_exceeded': '%d/%d' % (r.n_exceed, r.n_eval),   # n_exceed / n_eval
+        'weeks_exceeded': '%d/%d' % (r.n_exceed, r.n_eval),
         'episodes': _num(last.episodes.iloc[0], int) if len(last) and 'episodes' in last else None,
         'dev_slope12': _num(r.dev_slope12),
         'channel_contrib': {c: _num(w6[c + '_w'].mean()) for c in CHANNELS + PULSE if c + '_w' in w6},
